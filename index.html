@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>當沖計算機</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-zinc-100 text-zinc-900">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useMemo, useState } = React;
+
+        const PRODUCT_CONFIG = {
+            stock: {
+                label: '個股',
+                unitLabel: '股',
+                taxRate: 0.0015,
+            },
+            etf: {
+                label: 'ETF',
+                unitLabel: '單位',
+                taxRate: 0.0010,
+            },
+        };
+
+        const BASE_FEE_RATE = 0.001425;
+        const NON_DAY_TRADE_STOCK_TAX_RATE = 0.003;
+        const DEFAULT_TARGETS = '3, 2.5, 2, 1, 0, -1, -2';
+    const DEFAULT_LADDER_STEPS = 10;
+    const LADDER_STEP_INCREMENT = 5;
+
+        function clamp(value, min, max) {
+            return Math.min(max, Math.max(min, value));
+        }
+
+        function parseNumber(value, fallback = 0) {
+            const parsed = parseFloat(value);
+            return Number.isFinite(parsed) ? parsed : fallback;
+        }
+
+        function normalizePrice(value) {
+            return Number((Math.max(0.01, value)).toFixed(2));
+        }
+
+        function getTickSize(price, productType) {
+            if (productType === 'etf') {
+                return price < 50 ? 0.01 : 0.05;
+            }
+
+            if (price < 10) return 0.01;
+            if (price < 50) return 0.05;
+            if (price < 100) return 0.10;
+            if (price < 500) return 0.50;
+            if (price < 1000) return 1.00;
+            return 5.00;
+        }
+
+        function roundToTick(price, productType, mode = 'nearest') {
+            if (!Number.isFinite(price) || price <= 0) return null;
+
+            let rounded = price;
+            for (let i = 0; i < 6; i += 1) {
+                const tick = getTickSize(rounded, productType);
+                const ratio = price / tick;
+
+                if (mode === 'ceil') {
+                    rounded = Math.ceil(ratio - 1e-9) * tick;
+                } else if (mode === 'floor') {
+                    rounded = Math.floor(ratio + 1e-9) * tick;
+                } else {
+                    rounded = Math.round(ratio) * tick;
+                }
+            }
+
+            return normalizePrice(rounded);
+        }
+
+        function addTick(price, direction, productType) {
+            const referencePrice = direction > 0
+                ? price + 0.000001
+                : Math.max(0.01, price - 0.000001);
+            const next = price + (getTickSize(referencePrice, productType) * direction);
+            return normalizePrice(next);
+        }
+
+        function countTicksBetween(fromPrice, toPrice, productType) {
+            const from = roundToTick(fromPrice, productType, 'nearest');
+            const to = roundToTick(toPrice, productType, 'nearest');
+            if (!from || !to || from === to) return 0;
+
+            const direction = to > from ? 1 : -1;
+            let price = from;
+            let ticks = 0;
+
+            while (
+                ((direction > 0 && price < to - 1e-9) || (direction < 0 && price > to + 1e-9))
+                && Math.abs(ticks) < 50000
+            ) {
+                price = addTick(price, direction, productType);
+                ticks += direction;
+            }
+
+            return ticks;
+        }
+
+        function parseTargets(input) {
+            return String(input)
+                .split(/[,\s，、]+/)
+                .map((item) => parseFloat(item))
+                .filter((item) => Number.isFinite(item))
+                .slice(0, 12)
+                .map((item) => item / 100);
+        }
+
+        function calculateCommission(value, feeRate, minimumFee) {
+            if (value <= 0 || feeRate <= 0) return 0;
+            return Math.max(Math.floor(value * feeRate), minimumFee);
+        }
+
+        function calculateTax(value, taxRate) {
+            if (value <= 0 || taxRate <= 0) return 0;
+            return Math.round(value * taxRate);
+        }
+
+        function resolveTaxRate(productType, tradeMode) {
+            if (productType === 'stock' && tradeMode === 'nonDayTrade') {
+                return NON_DAY_TRADE_STOCK_TAX_RATE;
+            }
+
+            return PRODUCT_CONFIG[productType].taxRate;
+        }
+
+        function calculateEntry(entryPrice, shares, direction, feeRate, taxRate, minimumFee) {
+            const gross = entryPrice * shares;
+            const commission = calculateCommission(gross, feeRate, minimumFee);
+            const tax = direction === 'short' ? calculateTax(gross, taxRate) : 0;
+            const amount = direction === 'long'
+                ? gross + commission
+                : gross - commission - tax;
+
+            return { gross, commission, tax, amount };
+        }
+
+        function calculateRoundTrip(entryPrice, exitPrice, shares, direction, feeRate, taxRate, minimumFee) {
+            const entry = calculateEntry(entryPrice, shares, direction, feeRate, taxRate, minimumFee);
+            const exitGross = exitPrice * shares;
+            const exitCommission = calculateCommission(exitGross, feeRate, minimumFee);
+            const exitTax = direction === 'long' ? calculateTax(exitGross, taxRate) : 0;
+            const grossProfit = direction === 'long'
+                ? exitGross - entry.gross
+                : entry.gross - exitGross;
+            const exitAmount = direction === 'long'
+                ? exitGross - exitCommission - exitTax
+                : exitGross + exitCommission;
+            const profit = direction === 'long'
+                ? exitAmount - entry.amount
+                : entry.amount - exitAmount;
+            const totalFeesAndTax = entry.commission + entry.tax + exitCommission + exitTax;
+
+            return {
+                entry,
+                exitGross,
+                exitCommission,
+                exitTax,
+                exitAmount,
+                grossProfit,
+                totalFeesAndTax,
+                profit,
+            };
+        }
+
+        function estimateExitPrice(entry, desiredProfit, shares, direction, feeRate, taxRate) {
+            if (direction === 'long') {
+                return (entry.amount + desiredProfit) / (shares * (1 - feeRate - taxRate));
+            }
+
+            return (entry.amount - desiredProfit) / (shares * (1 + feeRate));
+        }
+
+        function settleExitPriceForProfit({
+            entry,
+            entryPrice,
+            shares,
+            productType,
+            direction,
+            feeRate,
+            taxRate,
+            minimumFee,
+            desiredProfit,
+        }) {
+            const estimate = estimateExitPrice(entry, desiredProfit, shares, direction, feeRate, taxRate);
+            const mode = direction === 'long' ? 'ceil' : 'floor';
+            let price = roundToTick(estimate, productType, mode) || 0.01;
+            let trade = calculateRoundTrip(entryPrice, price, shares, direction, feeRate, taxRate, minimumFee);
+            let guard = 0;
+
+            while (trade.profit < desiredProfit && guard < 50000) {
+                const nextPrice = addTick(price, direction === 'long' ? 1 : -1, productType);
+                if (nextPrice === price) break;
+
+                price = nextPrice;
+                trade = calculateRoundTrip(entryPrice, price, shares, direction, feeRate, taxRate, minimumFee);
+                guard += 1;
+            }
+
+            while (guard < 100000) {
+                const nextPrice = addTick(price, direction === 'long' ? -1 : 1, productType);
+                if (nextPrice === price || nextPrice <= 0) break;
+
+                const nextTrade = calculateRoundTrip(entryPrice, nextPrice, shares, direction, feeRate, taxRate, minimumFee);
+                if (nextTrade.profit < desiredProfit) break;
+
+                price = nextPrice;
+                trade = nextTrade;
+                guard += 1;
+            }
+
+            return {
+                theoreticalPrice: estimate,
+                exitPrice: price,
+                ticks: countTicksBetween(entryPrice, price, productType),
+                ...trade,
+            };
+        }
+
+        function calculateDayTrade({
+            direction,
+            tradeMode,
+            productType,
+            lots,
+            entryPriceInput,
+            exitPriceInput,
+            stopLossInput,
+            discountInput,
+            minimumFeeInput,
+            targetInput,
+        }) {
+            const rawEntryPrice = parseNumber(entryPriceInput, NaN);
+            const parsedLots = parseInt(lots, 10);
+            const validLots = Number.isFinite(parsedLots) && parsedLots > 0 ? parsedLots : 0;
+
+            if (!Number.isFinite(rawEntryPrice) || rawEntryPrice <= 0 || validLots <= 0) {
+                return null;
+            }
+
+            const product = PRODUCT_CONFIG[productType];
+            const discount = clamp(parseNumber(discountInput, 1), 0, 1);
+            const minimumFee = Math.max(0, Math.round(parseNumber(minimumFeeInput, 0)));
+            const feeRate = BASE_FEE_RATE * discount;
+            const taxRate = resolveTaxRate(productType, tradeMode);
+            const entryPrice = roundToTick(rawEntryPrice, productType, 'nearest');
+            const shares = validLots * 1000;
+            const entry = calculateEntry(entryPrice, shares, direction, feeRate, taxRate, minimumFee);
+            const targetRates = parseTargets(targetInput);
+            const targetRows = targetRates.map((rate) => {
+                const desiredProfit = entry.amount * rate;
+                const settled = settleExitPriceForProfit({
+                    entry,
+                    entryPrice,
+                    shares,
+                    productType,
+                    direction,
+                    feeRate,
+                    taxRate,
+                    minimumFee,
+                    desiredProfit,
+                });
+
+                return {
+                    rate,
+                    desiredProfit,
+                    actualRate: settled.profit / entry.amount,
+                    ...settled,
+                };
+            });
+
+            const breakEven = settleExitPriceForProfit({
+                entry,
+                entryPrice,
+                shares,
+                productType,
+                direction,
+                feeRate,
+                taxRate,
+                minimumFee,
+                desiredProfit: 0,
+            });
+
+            const stopLossAmount = parseNumber(stopLossInput, 0);
+            const stopLoss = stopLossAmount > 0
+                ? settleExitPriceForProfit({
+                    entry,
+                    entryPrice,
+                    shares,
+                    productType,
+                    direction,
+                    feeRate,
+                    taxRate,
+                    minimumFee,
+                    desiredProfit: -Math.abs(stopLossAmount),
+                })
+                : null;
+
+            const rawExitPrice = parseNumber(exitPriceInput, NaN);
+            const manualExitPrice = Number.isFinite(rawExitPrice) && rawExitPrice > 0
+                ? roundToTick(rawExitPrice, productType, 'nearest')
+                : null;
+            const manualExit = manualExitPrice
+                ? {
+                    exitPrice: manualExitPrice,
+                    ticks: countTicksBetween(entryPrice, manualExitPrice, productType),
+                    ...calculateRoundTrip(entryPrice, manualExitPrice, shares, direction, feeRate, taxRate, minimumFee),
+                }
+                : null;
+
+            return {
+                product,
+                direction,
+                productType,
+                lots: validLots,
+                shares,
+                entryPrice,
+                rawEntryPrice,
+                entryPriceAdjusted: Math.abs(entryPrice - rawEntryPrice) > 0.000001,
+                entryTick: getTickSize(entryPrice, productType),
+                feeRate,
+                taxRate,
+                discount,
+                minimumFee,
+                entry,
+                breakEven,
+                stopLoss,
+                manualExit,
+                targetRows,
+            };
+        }
+
+        function buildPriceLadder({
+            entryPrice,
+            entry,
+            shares,
+            direction,
+            productType,
+            feeRate,
+            taxRate,
+            minimumFee,
+            upwardLevels,
+            downwardLevels,
+        }) {
+            const upperRows = [];
+            let nextUpperPrice = entryPrice;
+
+            for (let level = 0; level < upwardLevels; level += 1) {
+                nextUpperPrice = addTick(nextUpperPrice, 1, productType);
+                const trade = calculateRoundTrip(entryPrice, nextUpperPrice, shares, direction, feeRate, taxRate, minimumFee);
+                upperRows.push({
+                    price: nextUpperPrice,
+                    ticks: countTicksBetween(entryPrice, nextUpperPrice, productType),
+                    returnRate: trade.profit / entry.amount,
+                    ...trade,
+                });
+            }
+
+            const lowerRows = [];
+            let nextLowerPrice = entryPrice;
+
+            for (let level = 0; level < downwardLevels; level += 1) {
+                const candidatePrice = addTick(nextLowerPrice, -1, productType);
+                if (!candidatePrice || candidatePrice <= 0 || candidatePrice === nextLowerPrice) {
+                    break;
+                }
+
+                nextLowerPrice = candidatePrice;
+                const trade = calculateRoundTrip(entryPrice, nextLowerPrice, shares, direction, feeRate, taxRate, minimumFee);
+                lowerRows.push({
+                    price: nextLowerPrice,
+                    ticks: countTicksBetween(entryPrice, nextLowerPrice, productType),
+                    returnRate: trade.profit / entry.amount,
+                    ...trade,
+                });
+            }
+
+            const centerTrade = calculateRoundTrip(entryPrice, entryPrice, shares, direction, feeRate, taxRate, minimumFee);
+
+            return {
+                upperRows,
+                lowerRows,
+                centerRow: {
+                    price: entryPrice,
+                    ticks: 0,
+                    returnRate: centerTrade.profit / entry.amount,
+                    ...centerTrade,
+                },
+            };
+        }
+
+        function formatCurrency(value) {
+            return Math.round(value).toLocaleString('zh-TW');
+        }
+
+        function formatSignedCurrency(value) {
+            const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+            return `${sign}${formatCurrency(Math.abs(value))}`;
+        }
+
+        function formatPrice(value) {
+            if (!Number.isFinite(value)) return '--';
+            return Number(value).toLocaleString('zh-TW', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+            });
+        }
+
+        function formatPercent(value) {
+            return `${(value * 100).toFixed(Math.abs(value * 100) >= 10 ? 1 : 2)}%`;
+        }
+
+        function profitClass(value) {
+            if (value > 0) return 'text-red-600';
+            if (value < 0) return 'text-emerald-700';
+            return 'text-zinc-700';
+        }
+
+        function priceClass(entryPrice, exitPrice) {
+            if (exitPrice > entryPrice) return 'text-red-600';
+            if (exitPrice < entryPrice) return 'text-emerald-700';
+            return 'text-zinc-700';
+        }
+
+        function tickLabel(ticks) {
+            if (ticks === 0) return '平盤';
+            return `${ticks > 0 ? '+' : ''}${ticks} 檔`;
+        }
+
+        function App() {
+            const [direction, setDirection] = useState('long');
+            const [tradeMode, setTradeMode] = useState('dayTrade');
+            const [productType, setProductType] = useState('stock');
+            const [lots, setLots] = useState('10');
+            const [entryPrice, setEntryPrice] = useState('');
+            const [exitPrice, setExitPrice] = useState('');
+            const [stopLoss, setStopLoss] = useState('');
+            const [discount, setDiscount] = useState('0.18');
+            const [minimumFee, setMinimumFee] = useState('20');
+            const [targets, setTargets] = useState(DEFAULT_TARGETS);
+            const [upwardLevels, setUpwardLevels] = useState(DEFAULT_LADDER_STEPS);
+            const [downwardLevels, setDownwardLevels] = useState(DEFAULT_LADDER_STEPS);
+
+            const results = useMemo(() => calculateDayTrade({
+                direction,
+                tradeMode,
+                productType,
+                lots,
+                entryPriceInput: entryPrice,
+                exitPriceInput: exitPrice,
+                stopLossInput: stopLoss,
+                discountInput: discount,
+                minimumFeeInput: minimumFee,
+                targetInput: targets,
+            }), [direction, tradeMode, productType, lots, entryPrice, exitPrice, stopLoss, discount, minimumFee, targets]);
+
+            const priceLadder = useMemo(() => {
+                if (!results) return null;
+
+                return buildPriceLadder({
+                    entryPrice: results.entryPrice,
+                    entry: results.entry,
+                    shares: results.shares,
+                    direction: results.direction,
+                    productType: results.productType,
+                    feeRate: results.feeRate,
+                    taxRate: results.taxRate,
+                    minimumFee: results.minimumFee,
+                    upwardLevels,
+                    downwardLevels,
+                });
+            }, [results, upwardLevels, downwardLevels]);
+
+            const handleLotsChange = (delta) => {
+                const currentLots = parseInt(lots, 10);
+                const nextLots = Math.max(1, (Number.isFinite(currentLots) ? currentLots : 1) + delta);
+                setLots(String(nextLots));
+            };
+
+            const inputClass = 'w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-base outline-none transition focus:border-zinc-900 focus:ring-2 focus:ring-zinc-200';
+            const labelClass = 'mb-1 block text-sm font-semibold text-zinc-700';
+
+            return (
+                <main className="mx-auto max-w-6xl px-4 py-5 sm:px-6 lg:py-8">
+                    <header className="mb-5 flex flex-col gap-2 border-b border-zinc-200 pb-4 sm:flex-row sm:items-end sm:justify-between">
+                        <div>
+                            <h1 className="text-2xl font-bold tracking-normal text-zinc-950">當沖計算機</h1>
+                            <p className="mt-1 text-sm text-zinc-500">含台股跳動單位、費稅、兩平價與停損反推</p>
+                        </div>
+                        <div className="text-sm text-zinc-500">
+                            1 張 = 1,000 {PRODUCT_CONFIG[productType].unitLabel}
+                        </div>
+                    </header>
+
+                    <div className="grid gap-5 lg:grid-cols-[360px_1fr]">
+                        <section className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm sm:p-5">
+                            <h2 className="mb-4 text-lg font-bold">參數設定</h2>
+
+                            <div className="space-y-4">
+                                <div>
+                                    <span className={labelClass}>方向</span>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {[
+                                            ['long', '先買後賣'],
+                                            ['short', '先賣後買'],
+                                        ].map(([value, label]) => (
+                                            <button
+                                                key={value}
+                                                type="button"
+                                                aria-pressed={direction === value}
+                                                onClick={() => setDirection(value)}
+                                                className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
+                                                    direction === value
+                                                        ? 'border-zinc-950 bg-zinc-950 text-white'
+                                                        : 'border-zinc-300 bg-white text-zinc-700 hover:border-zinc-500'
+                                                }`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <span className={labelClass}>交易類型</span>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {[
+                                            ['dayTrade', '當沖'],
+                                            ['nonDayTrade', '非當沖'],
+                                        ].map(([value, label]) => (
+                                            <button
+                                                key={value}
+                                                type="button"
+                                                aria-pressed={tradeMode === value}
+                                                onClick={() => setTradeMode(value)}
+                                                className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
+                                                    tradeMode === value
+                                                        ? 'border-zinc-950 bg-zinc-950 text-white'
+                                                        : 'border-zinc-300 bg-white text-zinc-700 hover:border-zinc-500'
+                                                }`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <span className={labelClass}>商品類型</span>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {Object.entries(PRODUCT_CONFIG).map(([value, config]) => (
+                                            <button
+                                                key={value}
+                                                type="button"
+                                                aria-pressed={productType === value}
+                                                onClick={() => setProductType(value)}
+                                                className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
+                                                    productType === value
+                                                        ? 'border-red-700 bg-red-700 text-white'
+                                                        : 'border-zinc-300 bg-white text-zinc-700 hover:border-zinc-500'
+                                                }`}
+                                            >
+                                                {config.label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <div className="mt-2 text-xs text-zinc-500">
+                                        證交稅：{(resolveTaxRate(productType, tradeMode) * 100).toFixed(2)}%
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className={labelClass} htmlFor="lots">張數</label>
+                                    <div className="flex">
+                                        <button
+                                            type="button"
+                                            onClick={() => handleLotsChange(-1)}
+                                            className="w-11 rounded-l-md border border-zinc-300 bg-zinc-50 text-lg font-bold hover:bg-zinc-100"
+                                            aria-label="減少張數"
+                                        >
+                                            -
+                                        </button>
+                                        <input
+                                            id="lots"
+                                            type="number"
+                                            min="1"
+                                            step="1"
+                                            inputMode="numeric"
+                                            value={lots}
+                                            onChange={(event) => setLots(event.target.value)}
+                                            className="w-full border-y border-zinc-300 px-3 py-2 text-center text-base outline-none focus:ring-2 focus:ring-zinc-200"
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => handleLotsChange(1)}
+                                            className="w-11 rounded-r-md border border-zinc-300 bg-zinc-50 text-lg font-bold hover:bg-zinc-100"
+                                            aria-label="增加張數"
+                                        >
+                                            +
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className={labelClass} htmlFor="entryPrice">進場價格</label>
+                                    <input
+                                        id="entryPrice"
+                                        type="number"
+                                        min="0.01"
+                                        step={results?.entryTick || 0.05}
+                                        inputMode="decimal"
+                                        value={entryPrice}
+                                        onChange={(event) => setEntryPrice(event.target.value)}
+                                        className={inputClass}
+                                        placeholder="例如 100"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className={labelClass} htmlFor="exitPrice">出場價格</label>
+                                    <input
+                                        id="exitPrice"
+                                        type="number"
+                                        min="0.01"
+                                        step={results?.entryTick || 0.05}
+                                        inputMode="decimal"
+                                        value={exitPrice}
+                                        onChange={(event) => setExitPrice(event.target.value)}
+                                        className={inputClass}
+                                        placeholder="選填"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className={labelClass} htmlFor="stopLoss">停損金額</label>
+                                    <input
+                                        id="stopLoss"
+                                        type="number"
+                                        min="0"
+                                        step="100"
+                                        inputMode="numeric"
+                                        value={stopLoss}
+                                        onChange={(event) => setStopLoss(event.target.value)}
+                                        className={inputClass}
+                                        placeholder="例如 5000"
+                                    />
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div>
+                                        <label className={labelClass} htmlFor="discount">手續費折數</label>
+                                        <input
+                                            id="discount"
+                                            type="number"
+                                            min="0"
+                                            max="1"
+                                            step="0.01"
+                                            inputMode="decimal"
+                                            value={discount}
+                                            onChange={(event) => setDiscount(event.target.value)}
+                                            className={inputClass}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className={labelClass} htmlFor="minimumFee">最低手續費</label>
+                                        <input
+                                            id="minimumFee"
+                                            type="number"
+                                            min="0"
+                                            step="1"
+                                            inputMode="numeric"
+                                            value={minimumFee}
+                                            onChange={(event) => setMinimumFee(event.target.value)}
+                                            className={inputClass}
+                                        />
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-4 gap-2">
+                                    {['1', '0.6', '0.38', '0.18'].map((value) => (
+                                        <button
+                                            key={value}
+                                            type="button"
+                                            onClick={() => setDiscount(value)}
+                                            className="rounded-md border border-zinc-300 bg-white px-2 py-2 text-sm font-semibold text-zinc-700 hover:border-zinc-500"
+                                        >
+                                            {value}
+                                        </button>
+                                    ))}
+                                </div>
+
+                                <div>
+                                    <label className={labelClass} htmlFor="targets">目標淨利率</label>
+                                    <input
+                                        id="targets"
+                                        type="text"
+                                        value={targets}
+                                        onChange={(event) => setTargets(event.target.value)}
+                                        className={inputClass}
+                                        placeholder={DEFAULT_TARGETS}
+                                    />
+                                </div>
+                            </div>
+                        </section>
+
+                        <section className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm sm:p-5">
+                            <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                                <div>
+                                    <h2 className="text-lg font-bold">試算結果</h2>
+                                    {results && (
+                                        <p className="text-sm text-zinc-500">
+                                            進場有效價 {formatPrice(results.entryPrice)}，升降單位 {formatPrice(results.entryTick)}
+                                        </p>
+                                    )}
+                                </div>
+                                {results?.entryPriceAdjusted && (
+                                    <div className="text-sm font-semibold text-amber-700">
+                                        進場價已取最接近可掛價
+                                    </div>
+                                )}
+                            </div>
+
+                            {!results ? (
+                                <div className="flex min-h-80 items-center justify-center rounded-lg border border-dashed border-zinc-300 px-4 text-center text-zinc-400">
+                                    輸入進場價格與張數後顯示結果
+                                </div>
+                            ) : (
+                                <div className="space-y-5">
+                                    <div className="grid overflow-hidden rounded-lg border border-zinc-200 sm:grid-cols-4">
+                                        <div className="border-b border-zinc-200 p-3 sm:border-b-0 sm:border-r">
+                                            <div className="text-xs font-semibold text-zinc-500">
+                                                {results.direction === 'long' ? '進場總成本' : '進場總收入'}
+                                            </div>
+                                            <div className="mt-1 text-xl font-bold">{formatCurrency(results.entry.amount)}</div>
+                                        </div>
+                                        <div className="border-b border-zinc-200 p-3 sm:border-b-0 sm:border-r">
+                                            <div className="text-xs font-semibold text-zinc-500">損益兩平價</div>
+                                            <div className={`mt-1 text-xl font-bold ${priceClass(results.entryPrice, results.breakEven.exitPrice)}`}>
+                                                {formatPrice(results.breakEven.exitPrice)}
+                                            </div>
+                                        </div>
+                                        <div className="border-b border-zinc-200 p-3 sm:border-b-0 sm:border-r">
+                                            <div className="text-xs font-semibold text-zinc-500">兩平需跳動</div>
+                                            <div className="mt-1 text-xl font-bold">{tickLabel(results.breakEven.ticks)}</div>
+                                        </div>
+                                        <div className="p-3">
+                                            <div className="text-xs font-semibold text-zinc-500">兩平費稅</div>
+                                            <div className="mt-1 text-xl font-bold">{formatCurrency(results.breakEven.totalFeesAndTax)}</div>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid gap-4 md:grid-cols-2">
+                                        <div className="rounded-lg border border-zinc-200 p-3">
+                                            <h3 className="text-sm font-bold text-zinc-700">進場明細</h3>
+                                            <dl className="mt-3 space-y-2 text-sm">
+                                                <div className="flex justify-between gap-3">
+                                                    <dt className="text-zinc-500">成交金額</dt>
+                                                    <dd className="font-semibold">{formatCurrency(results.entry.gross)}</dd>
+                                                </div>
+                                                <div className="flex justify-between gap-3">
+                                                    <dt className="text-zinc-500">進場手續費</dt>
+                                                    <dd className="font-semibold">{formatCurrency(results.entry.commission)}</dd>
+                                                </div>
+                                                <div className="flex justify-between gap-3">
+                                                    <dt className="text-zinc-500">進場證交稅</dt>
+                                                    <dd className="font-semibold">{formatCurrency(results.entry.tax)}</dd>
+                                                </div>
+                                            </dl>
+                                        </div>
+
+                                        <div className="rounded-lg border border-zinc-200 p-3">
+                                            <h3 className="text-sm font-bold text-zinc-700">費率設定</h3>
+                                            <dl className="mt-3 space-y-2 text-sm">
+                                                <div className="flex justify-between gap-3">
+                                                    <dt className="text-zinc-500">有效手續費率</dt>
+                                                    <dd className="font-semibold">{(results.feeRate * 100).toFixed(4)}%</dd>
+                                                </div>
+                                                <div className="flex justify-between gap-3">
+                                                    <dt className="text-zinc-500">證交稅率</dt>
+                                                    <dd className="font-semibold">{(results.taxRate * 100).toFixed(2)}%</dd>
+                                                </div>
+                                                <div className="flex justify-between gap-3">
+                                                    <dt className="text-zinc-500">計算股數</dt>
+                                                    <dd className="font-semibold">{results.shares.toLocaleString('zh-TW')}</dd>
+                                                </div>
+                                            </dl>
+                                        </div>
+                                    </div>
+
+                                    {results.manualExit && (
+                                        <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3">
+                                            <div className="grid gap-3 sm:grid-cols-5">
+                                                <div>
+                                                    <div className="text-xs font-semibold text-zinc-500">出場可掛價</div>
+                                                    <div className={`mt-1 text-lg font-bold ${priceClass(results.entryPrice, results.manualExit.exitPrice)}`}>
+                                                        {formatPrice(results.manualExit.exitPrice)}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-xs font-semibold text-zinc-500">跳動檔數</div>
+                                                    <div className="mt-1 text-lg font-bold">{tickLabel(results.manualExit.ticks)}</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-xs font-semibold text-zinc-500">來回費稅</div>
+                                                    <div className="mt-1 text-lg font-bold">{formatCurrency(results.manualExit.totalFeesAndTax)}</div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-xs font-semibold text-zinc-500">預估獲利</div>
+                                                    <div className={`mt-1 text-lg font-bold ${profitClass(results.manualExit.grossProfit)}`}>
+                                                        {formatSignedCurrency(results.manualExit.grossProfit)}
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <div className="text-xs font-semibold text-zinc-500">預估損益</div>
+                                                    <div className={`mt-1 text-lg font-bold ${profitClass(results.manualExit.profit)}`}>
+                                                        {formatSignedCurrency(results.manualExit.profit)}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {results.stopLoss && (
+                                        <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+                                            <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                                                <div>
+                                                    <div className="text-sm font-bold text-emerald-800">停損參考價</div>
+                                                    <div className="text-xs text-emerald-700">此價位預估損益 {formatSignedCurrency(results.stopLoss.profit)} 元</div>
+                                                </div>
+                                                <div className="text-2xl font-bold text-emerald-800">
+                                                    {formatPrice(results.stopLoss.exitPrice)}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div className="overflow-x-auto rounded-lg border border-zinc-200">
+                                        <table className="w-full min-w-[720px] border-collapse text-left text-sm">
+                                            <thead className="bg-zinc-50 text-xs uppercase tracking-wide text-zinc-500">
+                                                <tr>
+                                                    <th className="border-b border-zinc-200 px-3 py-2">目標</th>
+                                                    <th className="border-b border-zinc-200 px-3 py-2">理論價</th>
+                                                    <th className="border-b border-zinc-200 px-3 py-2">可掛價</th>
+                                                    <th className="border-b border-zinc-200 px-3 py-2">檔數</th>
+                                                    <th className="border-b border-zinc-200 px-3 py-2">實際淨利率</th>
+                                                    <th className="border-b border-zinc-200 px-3 py-2 text-right">預估損益</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {results.targetRows.map((row, index) => (
+                                                    <tr key={`${row.rate}-${index}`} className="hover:bg-zinc-50">
+                                                        <td className="border-b border-zinc-100 px-3 py-2 font-semibold">
+                                                            {formatPercent(row.rate)}
+                                                        </td>
+                                                        <td className="border-b border-zinc-100 px-3 py-2 text-zinc-500">
+                                                            {formatPrice(row.theoreticalPrice)}
+                                                        </td>
+                                                        <td className={`border-b border-zinc-100 px-3 py-2 font-bold ${priceClass(results.entryPrice, row.exitPrice)}`}>
+                                                            {formatPrice(row.exitPrice)}
+                                                        </td>
+                                                        <td className="border-b border-zinc-100 px-3 py-2">
+                                                            {tickLabel(row.ticks)}
+                                                        </td>
+                                                        <td className={`border-b border-zinc-100 px-3 py-2 font-semibold ${profitClass(row.profit)}`}>
+                                                            {formatPercent(row.actualRate)}
+                                                        </td>
+                                                        <td className={`border-b border-zinc-100 px-3 py-2 text-right font-bold ${profitClass(row.profit)}`}>
+                                                            {formatSignedCurrency(row.profit)}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+
+                                    {priceLadder && (
+                                        <div className="overflow-hidden rounded-lg border border-zinc-200">
+                                            <div className="flex flex-col gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                                                <div>
+                                                    <h3 className="text-sm font-bold text-zinc-800">預設上下十檔</h3>
+                                                    <p className="text-xs text-zinc-500">以進場有效價為基準，顯示上下檔位的費稅與損益變化</p>
+                                                </div>
+                                                <div className="flex flex-wrap gap-2">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setUpwardLevels((value) => value + LADDER_STEP_INCREMENT)}
+                                                        className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-700 transition hover:border-zinc-500"
+                                                    >
+                                                        顯示更多 (向上)
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setDownwardLevels((value) => value + LADDER_STEP_INCREMENT)}
+                                                        className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-700 transition hover:border-zinc-500"
+                                                    >
+                                                        顯示更多 (向下)
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div className="px-3 pb-3 pt-3">
+                                                <div className="max-h-[420px] overflow-auto rounded-lg border border-zinc-100 bg-white shadow-inner">
+                                                    <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+                                                    <thead className="sticky top-0 z-10 bg-white text-xs uppercase tracking-wide text-zinc-500 shadow-sm">
+                                                        <tr>
+                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2">價格</th>
+                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2">總稅費</th>
+                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2 text-right">預估損益</th>
+                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2 text-right">報酬率</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {[...priceLadder.upperRows].reverse().map((row) => (
+                                                            <tr key={`up-${row.price}`} className="hover:bg-zinc-50">
+                                                                <td className={`border-b border-zinc-100 px-3 py-2 font-semibold ${priceClass(results.entryPrice, row.price)}`}>
+                                                                    <div>{formatPrice(row.price)}</div>
+                                                                    <div className="text-xs font-normal text-zinc-500">{tickLabel(row.ticks)}</div>
+                                                                </td>
+                                                                <td className="border-b border-zinc-100 px-3 py-2 font-semibold text-zinc-700">
+                                                                    {formatCurrency(row.totalFeesAndTax)}
+                                                                </td>
+                                                                <td className={`border-b border-zinc-100 px-3 py-2 text-right font-bold ${profitClass(row.profit)}`}>
+                                                                    {formatSignedCurrency(row.profit)}
+                                                                </td>
+                                                                <td className={`border-b border-zinc-100 px-3 py-2 text-right font-semibold ${profitClass(row.profit)}`}>
+                                                                    {formatPercent(row.returnRate)}
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+
+                                                        <tr className="bg-zinc-50/80">
+                                                            <td className="border-b border-zinc-200 px-3 py-2 font-bold text-zinc-900">
+                                                                <div>{formatPrice(priceLadder.centerRow.price)}</div>
+                                                                <div className="text-xs font-normal text-zinc-500">進場價 / {tickLabel(priceLadder.centerRow.ticks)}</div>
+                                                            </td>
+                                                            <td className="border-b border-zinc-200 px-3 py-2 font-semibold text-zinc-700">
+                                                                {formatCurrency(priceLadder.centerRow.totalFeesAndTax)}
+                                                            </td>
+                                                            <td className={`border-b border-zinc-200 px-3 py-2 text-right font-bold ${profitClass(priceLadder.centerRow.profit)}`}>
+                                                                {formatSignedCurrency(priceLadder.centerRow.profit)}
+                                                            </td>
+                                                            <td className={`border-b border-zinc-200 px-3 py-2 text-right font-semibold ${profitClass(priceLadder.centerRow.profit)}`}>
+                                                                {formatPercent(priceLadder.centerRow.returnRate)}
+                                                            </td>
+                                                        </tr>
+
+                                                        {priceLadder.lowerRows.map((row) => (
+                                                            <tr key={`down-${row.price}`} className="hover:bg-zinc-50">
+                                                                <td className={`border-b border-zinc-100 px-3 py-2 font-semibold ${priceClass(results.entryPrice, row.price)}`}>
+                                                                    <div>{formatPrice(row.price)}</div>
+                                                                    <div className="text-xs font-normal text-zinc-500">{tickLabel(row.ticks)}</div>
+                                                                </td>
+                                                                <td className="border-b border-zinc-100 px-3 py-2 font-semibold text-zinc-700">
+                                                                    {formatCurrency(row.totalFeesAndTax)}
+                                                                </td>
+                                                                <td className={`border-b border-zinc-100 px-3 py-2 text-right font-bold ${profitClass(row.profit)}`}>
+                                                                    {formatSignedCurrency(row.profit)}
+                                                                </td>
+                                                                <td className={`border-b border-zinc-100 px-3 py-2 text-right font-semibold ${profitClass(row.profit)}`}>
+                                                                    {formatPercent(row.returnRate)}
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                    <p className="text-xs leading-5 text-zinc-500">
+                                        升降單位依臺灣證券交易所集中市場規則估算；個股當沖證交稅以千分之 1.5、個股非當沖以千分之 3、一般 ETF 以千分之 1 試算。特殊商品與手續費、稅額取整仍以券商成交回報為準。
+                                    </p>
+                                </div>
+                            )}
+                        </section>
+                    </div>
+                </main>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
