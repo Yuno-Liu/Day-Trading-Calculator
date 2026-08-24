@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>當沖計算機</title>
+    <title>當沖 / 融資融券計算機</title>
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -31,8 +31,17 @@
         const BASE_FEE_RATE = 0.001425;
         const NON_DAY_TRADE_STOCK_TAX_RATE = 0.003;
         const DEFAULT_TARGETS = '3, 2.5, 2, 1, 0, -1, -2';
-    const DEFAULT_LADDER_STEPS = 10;
-    const LADDER_STEP_INCREMENT = 5;
+        const DEFAULT_LADDER_STEPS = 10;
+        const LADDER_STEP_INCREMENT = 5;
+
+        // 融資融券預設值
+        const DEFAULT_MARGIN_SELF_RATIO = '40'; // 自備款預設 40%
+        const DEFAULT_MARGIN_INTEREST_RATE = '4'; // 融資年利率預設 4%
+        const DEFAULT_MARGIN_DAYS = '30'; // 融資天數預設 30 天
+        const DEFAULT_SHORT_MARGIN_RATIO = '90'; // 融券保證金預設 90%
+        const DEFAULT_SHORT_FEE_RATE = '0.08'; // 融券手續費 (借券費率) 0.08%
+        const DEFAULT_SHORT_INTEREST_RATE = '0.1'; // 融券保證金與擔保金年利率 0.1%
+        const DEFAULT_SHORT_DAYS = '30'; // 融券天數預設 30 天
 
         function clamp(value, min, max) {
             return Math.min(max, Math.max(min, value));
@@ -127,54 +136,198 @@
             return Math.round(value * taxRate);
         }
 
-        function resolveTaxRate(productType, tradeMode) {
-            if (productType === 'stock' && tradeMode === 'nonDayTrade') {
-                return NON_DAY_TRADE_STOCK_TAX_RATE;
+        function resolveTaxRate(productType, tradeMode, days = 0) {
+            if (productType === 'etf') {
+                return PRODUCT_CONFIG.etf.taxRate;
             }
 
-            return PRODUCT_CONFIG[productType].taxRate;
+            if (tradeMode === 'dayTrade') {
+                return PRODUCT_CONFIG.stock.taxRate;
+            }
+
+            if (tradeMode === 'marginLong' || tradeMode === 'marginShort') {
+                return days === 0 ? PRODUCT_CONFIG.stock.taxRate : NON_DAY_TRADE_STOCK_TAX_RATE;
+            }
+
+            return NON_DAY_TRADE_STOCK_TAX_RATE;
         }
 
-        function calculateEntry(entryPrice, shares, direction, feeRate, taxRate, minimumFee) {
+        function calculateEntry({
+            entryPrice,
+            shares,
+            direction,
+            tradeMode,
+            feeRate,
+            taxRate,
+            minimumFee,
+            marginSelfRatio,
+            shortMarginRatio,
+            productType,
+        }) {
             const gross = entryPrice * shares;
             const commission = calculateCommission(gross, feeRate, minimumFee);
             const tax = direction === 'short' ? calculateTax(gross, taxRate) : 0;
-            const amount = direction === 'long'
-                ? gross + commission
-                : gross - commission - tax;
 
-            return { gross, commission, tax, amount };
+            let marginLoan = 0;
+            let selfMargin = 0;
+            let shortCollateral = 0;
+            let shortGuarantyFund = 0;
+            let amount = 0;
+            let marginCallPrice = null;
+            let initialMaintenanceRatio = null;
+
+            if (tradeMode === 'marginLong') {
+                const loanRatio = 1 - marginSelfRatio;
+                // 台股融資金額以千元為單位，未滿千元無條件捨去
+                marginLoan = Math.floor((gross * loanRatio) / 1000) * 1000;
+                selfMargin = gross - marginLoan;
+                amount = selfMargin + commission;
+                initialMaintenanceRatio = marginLoan > 0 ? (gross / marginLoan) * 100 : 0;
+                // 融資 130% 追繳線: (市價 * 股數) / 融資金額 = 1.30 -> 市價 = (融資金額 * 1.30) / 股數
+                marginCallPrice = marginLoan > 0 ? roundToTick((marginLoan * 1.30) / shares, productType, 'ceil') : null;
+            } else if (tradeMode === 'marginShort') {
+                // 台股融券保證金以百元為單位無條件進位
+                shortCollateral = Math.ceil((gross * shortMarginRatio) / 100) * 100;
+                shortGuarantyFund = gross - commission - tax;
+                amount = shortCollateral + commission + tax;
+                initialMaintenanceRatio = gross > 0 ? ((shortCollateral + shortGuarantyFund) / gross) * 100 : 0;
+                // 融券 130% 追繳線: (保證金 + 擔保金) / (市價 * 股數) = 1.30 -> 市價 = (保證金 + 擔保金) / (1.30 * 股數)
+                marginCallPrice = shares > 0 ? roundToTick((shortCollateral + shortGuarantyFund) / (1.30 * shares), productType, 'floor') : null;
+            } else {
+                amount = direction === 'long'
+                    ? gross + commission
+                    : gross - commission - tax;
+            }
+
+            return {
+                gross,
+                commission,
+                tax,
+                amount,
+                marginLoan,
+                selfMargin,
+                shortCollateral,
+                shortGuarantyFund,
+                initialMaintenanceRatio,
+                marginCallPrice,
+            };
         }
 
-        function calculateRoundTrip(entryPrice, exitPrice, shares, direction, feeRate, taxRate, minimumFee) {
-            const entry = calculateEntry(entryPrice, shares, direction, feeRate, taxRate, minimumFee);
+        function calculateRoundTrip({
+            entry,
+            entryPrice,
+            exitPrice,
+            shares,
+            direction,
+            tradeMode,
+            feeRate,
+            taxRate,
+            minimumFee,
+            marginInterestRate = 0.04,
+            marginDays = 30,
+            shortFeeRate = 0.0008,
+            shortInterestRate = 0.001,
+            shortDays = 30,
+            productType = 'stock',
+        }) {
             const exitGross = exitPrice * shares;
             const exitCommission = calculateCommission(exitGross, feeRate, minimumFee);
             const exitTax = direction === 'long' ? calculateTax(exitGross, taxRate) : 0;
-            const grossProfit = direction === 'long'
-                ? exitGross - entry.gross
-                : entry.gross - exitGross;
-            const exitAmount = direction === 'long'
-                ? exitGross - exitCommission - exitTax
-                : exitGross + exitCommission;
-            const profit = direction === 'long'
-                ? exitAmount - entry.amount
-                : entry.amount - exitAmount;
-            const totalFeesAndTax = entry.commission + entry.tax + exitCommission + exitTax;
+
+            let grossProfit = 0;
+            let totalFeesAndTax = 0;
+            let profit = 0;
+            let exitAmount = 0;
+            let marginInterest = 0;
+            let shortFee = 0;
+            let shortInterest = 0;
+            let maintenanceRatio = null;
+
+            if (tradeMode === 'marginLong') {
+                marginInterest = (entry.marginLoan > 0 && marginDays > 0)
+                    ? Math.round(entry.marginLoan * (marginInterestRate / 365) * marginDays)
+                    : 0;
+                grossProfit = exitGross - entry.gross;
+                totalFeesAndTax = entry.commission + exitCommission + exitTax + marginInterest;
+                profit = grossProfit - totalFeesAndTax;
+                // 融資賣出結算入帳退款
+                exitAmount = exitGross - exitCommission - exitTax - entry.marginLoan - marginInterest;
+                maintenanceRatio = entry.marginLoan > 0 ? (exitGross / entry.marginLoan) * 100 : 0;
+            } else if (tradeMode === 'marginShort') {
+                shortFee = Math.round(entry.gross * shortFeeRate);
+                shortInterest = (shortDays > 0)
+                    ? Math.round((entry.shortCollateral + entry.shortGuarantyFund) * (shortInterestRate / 365) * shortDays)
+                    : 0;
+                grossProfit = entry.gross - exitGross;
+                totalFeesAndTax = entry.commission + entry.tax + exitCommission + shortFee - shortInterest;
+                profit = grossProfit - totalFeesAndTax;
+                // 融券買進回補結算退回保證金與損益
+                exitAmount = entry.shortCollateral + entry.shortGuarantyFund - exitGross - exitCommission - shortFee + shortInterest;
+                maintenanceRatio = exitGross > 0 ? ((entry.shortCollateral + entry.shortGuarantyFund) / exitGross) * 100 : 0;
+            } else {
+                if (direction === 'long') {
+                    grossProfit = exitGross - entry.gross;
+                    totalFeesAndTax = entry.commission + exitCommission + exitTax;
+                    exitAmount = exitGross - exitCommission - exitTax;
+                    profit = exitAmount - entry.amount;
+                } else {
+                    grossProfit = entry.gross - exitGross;
+                    totalFeesAndTax = entry.commission + entry.tax + exitCommission;
+                    exitAmount = exitGross + exitCommission;
+                    profit = entry.amount - exitAmount;
+                }
+            }
+
+            const returnRate = entry.amount > 0 ? profit / entry.amount : 0;
+            const nominalReturnRate = entry.gross > 0 ? (direction === 'long' ? exitGross - entry.gross : entry.gross - exitGross) / entry.gross : 0;
 
             return {
                 entry,
                 exitGross,
                 exitCommission,
                 exitTax,
-                exitAmount,
+                marginInterest,
+                shortFee,
+                shortInterest,
                 grossProfit,
                 totalFeesAndTax,
+                exitAmount,
                 profit,
+                returnRate,
+                nominalReturnRate,
+                maintenanceRatio,
             };
         }
 
-        function estimateExitPrice(entry, desiredProfit, shares, direction, feeRate, taxRate) {
+        function estimateExitPrice({
+            entry,
+            desiredProfit,
+            shares,
+            direction,
+            tradeMode,
+            feeRate,
+            taxRate,
+            marginInterestRate,
+            marginDays,
+            shortFeeRate,
+            shortInterestRate,
+            shortDays,
+        }) {
+            if (tradeMode === 'marginLong') {
+                const marginInterest = (entry.marginLoan > 0 && marginDays > 0)
+                    ? Math.round(entry.marginLoan * (marginInterestRate / 365) * marginDays)
+                    : 0;
+                return (entry.gross + entry.commission + marginInterest + desiredProfit) / (shares * (1 - feeRate - taxRate));
+            }
+
+            if (tradeMode === 'marginShort') {
+                const shortFee = Math.round(entry.gross * shortFeeRate);
+                const shortInterest = (shortDays > 0)
+                    ? Math.round((entry.shortCollateral + entry.shortGuarantyFund) * (shortInterestRate / 365) * shortDays)
+                    : 0;
+                return (entry.gross - entry.commission - entry.tax - shortFee + shortInterest - desiredProfit) / (shares * (1 + feeRate));
+            }
+
             if (direction === 'long') {
                 return (entry.amount + desiredProfit) / (shares * (1 - feeRate - taxRate));
             }
@@ -182,21 +335,48 @@
             return (entry.amount - desiredProfit) / (shares * (1 + feeRate));
         }
 
-        function settleExitPriceForProfit({
-            entry,
-            entryPrice,
-            shares,
-            productType,
-            direction,
-            feeRate,
-            taxRate,
-            minimumFee,
-            desiredProfit,
-        }) {
-            const estimate = estimateExitPrice(entry, desiredProfit, shares, direction, feeRate, taxRate);
+        function settleExitPriceForProfit(params) {
+            const {
+                entry,
+                entryPrice,
+                shares,
+                productType,
+                direction,
+                tradeMode,
+                feeRate,
+                taxRate,
+                minimumFee,
+                marginInterestRate,
+                marginDays,
+                shortFeeRate,
+                shortInterestRate,
+                shortDays,
+                desiredProfit,
+            } = params;
+
+            const estimate = estimateExitPrice(params);
             const mode = direction === 'long' ? 'ceil' : 'floor';
             let price = roundToTick(estimate, productType, mode) || 0.01;
-            let trade = calculateRoundTrip(entryPrice, price, shares, direction, feeRate, taxRate, minimumFee);
+
+            const tripParams = {
+                entry,
+                entryPrice,
+                exitPrice: price,
+                shares,
+                direction,
+                tradeMode,
+                feeRate,
+                taxRate,
+                minimumFee,
+                marginInterestRate,
+                marginDays,
+                shortFeeRate,
+                shortInterestRate,
+                shortDays,
+                productType,
+            };
+
+            let trade = calculateRoundTrip(tripParams);
             let guard = 0;
 
             while (trade.profit < desiredProfit && guard < 50000) {
@@ -204,7 +384,8 @@
                 if (nextPrice === price) break;
 
                 price = nextPrice;
-                trade = calculateRoundTrip(entryPrice, price, shares, direction, feeRate, taxRate, minimumFee);
+                tripParams.exitPrice = price;
+                trade = calculateRoundTrip(tripParams);
                 guard += 1;
             }
 
@@ -212,7 +393,8 @@
                 const nextPrice = addTick(price, direction === 'long' ? -1 : 1, productType);
                 if (nextPrice === price || nextPrice <= 0) break;
 
-                const nextTrade = calculateRoundTrip(entryPrice, nextPrice, shares, direction, feeRate, taxRate, minimumFee);
+                tripParams.exitPrice = nextPrice;
+                const nextTrade = calculateRoundTrip(tripParams);
                 if (nextTrade.profit < desiredProfit) break;
 
                 price = nextPrice;
@@ -239,6 +421,13 @@
             discountInput,
             minimumFeeInput,
             targetInput,
+            marginSelfRatioInput,
+            marginInterestRateInput,
+            marginDaysInput,
+            shortMarginRatioInput,
+            shortFeeRateInput,
+            shortInterestRateInput,
+            shortDaysInput,
         }) {
             const rawEntryPrice = parseNumber(entryPriceInput, NaN);
             const parsedLots = parseInt(lots, 10);
@@ -252,10 +441,35 @@
             const discount = clamp(parseNumber(discountInput, 1), 0, 1);
             const minimumFee = Math.max(0, Math.round(parseNumber(minimumFeeInput, 0)));
             const feeRate = BASE_FEE_RATE * discount;
-            const taxRate = resolveTaxRate(productType, tradeMode);
+
+            // 融資融券參數解析
+            const marginSelfRatio = clamp(parseNumber(marginSelfRatioInput, 40) / 100, 0.1, 1.0);
+            const marginInterestRate = Math.max(0, parseNumber(marginInterestRateInput, 4) / 100);
+            const marginDays = Math.max(0, Math.round(parseNumber(marginDaysInput, 30)));
+
+            const shortMarginRatio = clamp(parseNumber(shortMarginRatioInput, 90) / 100, 0.1, 2.0);
+            const shortFeeRate = Math.max(0, parseNumber(shortFeeRateInput, 0.08) / 100);
+            const shortInterestRate = Math.max(0, parseNumber(shortInterestRateInput, 0.1) / 100);
+            const shortDays = Math.max(0, Math.round(parseNumber(shortDaysInput, 30)));
+
+            const holdingDays = tradeMode === 'marginLong' ? marginDays : (tradeMode === 'marginShort' ? shortDays : 0);
+            const taxRate = resolveTaxRate(productType, tradeMode, holdingDays);
             const entryPrice = roundToTick(rawEntryPrice, productType, 'nearest');
             const shares = validLots * 1000;
-            const entry = calculateEntry(entryPrice, shares, direction, feeRate, taxRate, minimumFee);
+
+            const entry = calculateEntry({
+                entryPrice,
+                shares,
+                direction,
+                tradeMode,
+                feeRate,
+                taxRate,
+                minimumFee,
+                marginSelfRatio,
+                shortMarginRatio,
+                productType,
+            });
+
             const targetRates = parseTargets(targetInput);
             const targetRows = targetRates.map((rate) => {
                 const desiredProfit = entry.amount * rate;
@@ -265,16 +479,22 @@
                     shares,
                     productType,
                     direction,
+                    tradeMode,
                     feeRate,
                     taxRate,
                     minimumFee,
+                    marginInterestRate,
+                    marginDays,
+                    shortFeeRate,
+                    shortInterestRate,
+                    shortDays,
                     desiredProfit,
                 });
 
                 return {
                     rate,
                     desiredProfit,
-                    actualRate: settled.profit / entry.amount,
+                    actualRate: entry.amount > 0 ? settled.profit / entry.amount : 0,
                     ...settled,
                 };
             });
@@ -285,9 +505,15 @@
                 shares,
                 productType,
                 direction,
+                tradeMode,
                 feeRate,
                 taxRate,
                 minimumFee,
+                marginInterestRate,
+                marginDays,
+                shortFeeRate,
+                shortInterestRate,
+                shortDays,
                 desiredProfit: 0,
             });
 
@@ -299,9 +525,15 @@
                     shares,
                     productType,
                     direction,
+                    tradeMode,
                     feeRate,
                     taxRate,
                     minimumFee,
+                    marginInterestRate,
+                    marginDays,
+                    shortFeeRate,
+                    shortInterestRate,
+                    shortDays,
                     desiredProfit: -Math.abs(stopLossAmount),
                 })
                 : null;
@@ -310,17 +542,35 @@
             const manualExitPrice = Number.isFinite(rawExitPrice) && rawExitPrice > 0
                 ? roundToTick(rawExitPrice, productType, 'nearest')
                 : null;
+
             const manualExit = manualExitPrice
                 ? {
                     exitPrice: manualExitPrice,
                     ticks: countTicksBetween(entryPrice, manualExitPrice, productType),
-                    ...calculateRoundTrip(entryPrice, manualExitPrice, shares, direction, feeRate, taxRate, minimumFee),
+                    ...calculateRoundTrip({
+                        entry,
+                        entryPrice,
+                        exitPrice: manualExitPrice,
+                        shares,
+                        direction,
+                        tradeMode,
+                        feeRate,
+                        taxRate,
+                        minimumFee,
+                        marginInterestRate,
+                        marginDays,
+                        shortFeeRate,
+                        shortInterestRate,
+                        shortDays,
+                        productType,
+                    }),
                 }
                 : null;
 
             return {
                 product,
                 direction,
+                tradeMode,
                 productType,
                 lots: validLots,
                 shares,
@@ -332,6 +582,13 @@
                 taxRate,
                 discount,
                 minimumFee,
+                marginSelfRatio,
+                marginInterestRate,
+                marginDays,
+                shortMarginRatio,
+                shortFeeRate,
+                shortInterestRate,
+                shortDays,
                 entry,
                 breakEven,
                 stopLoss,
@@ -345,10 +602,16 @@
             entry,
             shares,
             direction,
+            tradeMode,
             productType,
             feeRate,
             taxRate,
             minimumFee,
+            marginInterestRate,
+            marginDays,
+            shortFeeRate,
+            shortInterestRate,
+            shortDays,
             upwardLevels,
             downwardLevels,
         }) {
@@ -357,11 +620,27 @@
 
             for (let level = 0; level < upwardLevels; level += 1) {
                 nextUpperPrice = addTick(nextUpperPrice, 1, productType);
-                const trade = calculateRoundTrip(entryPrice, nextUpperPrice, shares, direction, feeRate, taxRate, minimumFee);
+                const trade = calculateRoundTrip({
+                    entry,
+                    entryPrice,
+                    exitPrice: nextUpperPrice,
+                    shares,
+                    direction,
+                    tradeMode,
+                    feeRate,
+                    taxRate,
+                    minimumFee,
+                    marginInterestRate,
+                    marginDays,
+                    shortFeeRate,
+                    shortInterestRate,
+                    shortDays,
+                    productType,
+                });
                 upperRows.push({
                     price: nextUpperPrice,
                     ticks: countTicksBetween(entryPrice, nextUpperPrice, productType),
-                    returnRate: trade.profit / entry.amount,
+                    returnRate: entry.amount > 0 ? trade.profit / entry.amount : 0,
                     ...trade,
                 });
             }
@@ -376,16 +655,48 @@
                 }
 
                 nextLowerPrice = candidatePrice;
-                const trade = calculateRoundTrip(entryPrice, nextLowerPrice, shares, direction, feeRate, taxRate, minimumFee);
+                const trade = calculateRoundTrip({
+                    entry,
+                    entryPrice,
+                    exitPrice: nextLowerPrice,
+                    shares,
+                    direction,
+                    tradeMode,
+                    feeRate,
+                    taxRate,
+                    minimumFee,
+                    marginInterestRate,
+                    marginDays,
+                    shortFeeRate,
+                    shortInterestRate,
+                    shortDays,
+                    productType,
+                });
                 lowerRows.push({
                     price: nextLowerPrice,
                     ticks: countTicksBetween(entryPrice, nextLowerPrice, productType),
-                    returnRate: trade.profit / entry.amount,
+                    returnRate: entry.amount > 0 ? trade.profit / entry.amount : 0,
                     ...trade,
                 });
             }
 
-            const centerTrade = calculateRoundTrip(entryPrice, entryPrice, shares, direction, feeRate, taxRate, minimumFee);
+            const centerTrade = calculateRoundTrip({
+                entry,
+                entryPrice,
+                exitPrice: entryPrice,
+                shares,
+                direction,
+                tradeMode,
+                feeRate,
+                taxRate,
+                minimumFee,
+                marginInterestRate,
+                marginDays,
+                shortFeeRate,
+                shortInterestRate,
+                shortDays,
+                productType,
+            });
 
             return {
                 upperRows,
@@ -393,7 +704,7 @@
                 centerRow: {
                     price: entryPrice,
                     ticks: 0,
-                    returnRate: centerTrade.profit / entry.amount,
+                    returnRate: entry.amount > 0 ? centerTrade.profit / entry.amount : 0,
                     ...centerTrade,
                 },
             };
@@ -439,7 +750,7 @@
 
         function App() {
             const [direction, setDirection] = useState('long');
-            const [tradeMode, setTradeMode] = useState('dayTrade');
+            const [tradeMode, setTradeMode] = useState('marginLong'); // 預設提供融資
             const [productType, setProductType] = useState('stock');
             const [lots, setLots] = useState('10');
             const [entryPrice, setEntryPrice] = useState('');
@@ -448,8 +759,37 @@
             const [discount, setDiscount] = useState('0.18');
             const [minimumFee, setMinimumFee] = useState('20');
             const [targets, setTargets] = useState(DEFAULT_TARGETS);
+
+            // 融資融券 State
+            const [marginSelfRatio, setMarginSelfRatio] = useState(DEFAULT_MARGIN_SELF_RATIO); // 預設 40%
+            const [marginInterestRate, setMarginInterestRate] = useState(DEFAULT_MARGIN_INTEREST_RATE); // 預設 4%
+            const [marginDays, setMarginDays] = useState(DEFAULT_MARGIN_DAYS); // 預設 30 天
+
+            const [shortMarginRatio, setShortMarginRatio] = useState(DEFAULT_SHORT_MARGIN_RATIO); // 預設 90%
+            const [shortFeeRate, setShortFeeRate] = useState(DEFAULT_SHORT_FEE_RATE); // 預設 0.08%
+            const [shortInterestRate, setShortInterestRate] = useState(DEFAULT_SHORT_INTEREST_RATE); // 預設 0.1%
+            const [shortDays, setShortDays] = useState(DEFAULT_SHORT_DAYS); // 預設 30 天
+
             const [upwardLevels, setUpwardLevels] = useState(DEFAULT_LADDER_STEPS);
             const [downwardLevels, setDownwardLevels] = useState(DEFAULT_LADDER_STEPS);
+
+            const handleModeSelect = (mode) => {
+                setTradeMode(mode);
+                if (mode === 'marginLong') {
+                    setDirection('long');
+                } else if (mode === 'marginShort') {
+                    setDirection('short');
+                }
+            };
+
+            const handleDirectionSelect = (dir) => {
+                setDirection(dir);
+                if (dir === 'long' && tradeMode === 'marginShort') {
+                    setTradeMode('marginLong');
+                } else if (dir === 'short' && tradeMode === 'marginLong') {
+                    setTradeMode('marginShort');
+                }
+            };
 
             const results = useMemo(() => calculateDayTrade({
                 direction,
@@ -462,7 +802,32 @@
                 discountInput: discount,
                 minimumFeeInput: minimumFee,
                 targetInput: targets,
-            }), [direction, tradeMode, productType, lots, entryPrice, exitPrice, stopLoss, discount, minimumFee, targets]);
+                marginSelfRatioInput: marginSelfRatio,
+                marginInterestRateInput: marginInterestRate,
+                marginDaysInput: marginDays,
+                shortMarginRatioInput: shortMarginRatio,
+                shortFeeRateInput: shortFeeRate,
+                shortInterestRateInput: shortInterestRate,
+                shortDaysInput: shortDays,
+            }), [
+                direction,
+                tradeMode,
+                productType,
+                lots,
+                entryPrice,
+                exitPrice,
+                stopLoss,
+                discount,
+                minimumFee,
+                targets,
+                marginSelfRatio,
+                marginInterestRate,
+                marginDays,
+                shortMarginRatio,
+                shortFeeRate,
+                shortInterestRate,
+                shortDays,
+            ]);
 
             const priceLadder = useMemo(() => {
                 if (!results) return null;
@@ -472,10 +837,16 @@
                     entry: results.entry,
                     shares: results.shares,
                     direction: results.direction,
+                    tradeMode: results.tradeMode,
                     productType: results.productType,
                     feeRate: results.feeRate,
                     taxRate: results.taxRate,
                     minimumFee: results.minimumFee,
+                    marginInterestRate: results.marginInterestRate,
+                    marginDays: results.marginDays,
+                    shortFeeRate: results.shortFeeRate,
+                    shortInterestRate: results.shortInterestRate,
+                    shortDays: results.shortDays,
                     upwardLevels,
                     downwardLevels,
                 });
@@ -490,59 +861,44 @@
             const inputClass = 'w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-base outline-none transition focus:border-zinc-900 focus:ring-2 focus:ring-zinc-200';
             const labelClass = 'mb-1 block text-sm font-semibold text-zinc-700';
 
+            // 判斷是否為保證金/信用交易
+            const isMarginLong = tradeMode === 'marginLong';
+            const isMarginShort = tradeMode === 'marginShort';
+            const isCreditTrade = isMarginLong || isMarginShort;
+
             return (
                 <main className="mx-auto max-w-6xl px-4 py-5 sm:px-6 lg:py-8">
                     <header className="mb-5 flex flex-col gap-2 border-b border-zinc-200 pb-4 sm:flex-row sm:items-end sm:justify-between">
                         <div>
-                            <h1 className="text-2xl font-bold tracking-normal text-zinc-950">當沖計算機</h1>
-                            <p className="mt-1 text-sm text-zinc-500">含台股跳動單位、費稅、兩平價與停損反推</p>
+                            <h1 className="text-2xl font-bold tracking-normal text-zinc-950">當沖 / 融資融券計算機</h1>
+                            <p className="mt-1 text-sm text-zinc-500">含台股跳動單位、手續費折讓、證交稅、融資利息、融券費率、維持率追繳線與兩平價試算</p>
                         </div>
-                        <div className="text-sm text-zinc-500">
+                        <div className="text-sm font-medium text-zinc-500">
                             1 張 = 1,000 {PRODUCT_CONFIG[productType].unitLabel}
                         </div>
                     </header>
 
-                    <div className="grid gap-5 lg:grid-cols-[360px_1fr]">
+                    <div className="grid gap-5 lg:grid-cols-[380px_1fr]">
+                        {/* 左側參數設定 */}
                         <section className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm sm:p-5">
                             <h2 className="mb-4 text-lg font-bold">參數設定</h2>
 
                             <div className="space-y-4">
-                                <div>
-                                    <span className={labelClass}>方向</span>
-                                    <div className="grid grid-cols-2 gap-2">
-                                        {[
-                                            ['long', '先買後賣'],
-                                            ['short', '先賣後買'],
-                                        ].map(([value, label]) => (
-                                            <button
-                                                key={value}
-                                                type="button"
-                                                aria-pressed={direction === value}
-                                                onClick={() => setDirection(value)}
-                                                className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
-                                                    direction === value
-                                                        ? 'border-zinc-950 bg-zinc-950 text-white'
-                                                        : 'border-zinc-300 bg-white text-zinc-700 hover:border-zinc-500'
-                                                }`}
-                                            >
-                                                {label}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
-
+                                {/* 交易模式選擇 */}
                                 <div>
                                     <span className={labelClass}>交易類型</span>
-                                    <div className="grid grid-cols-2 gap-2">
+                                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-2">
                                         {[
-                                            ['dayTrade', '當沖'],
-                                            ['nonDayTrade', '非當沖'],
+                                            ['dayTrade', '現股當沖'],
+                                            ['nonDayTrade', '現股非當沖'],
+                                            ['marginLong', '融資買進'],
+                                            ['marginShort', '融券賣出'],
                                         ].map(([value, label]) => (
                                             <button
                                                 key={value}
                                                 type="button"
                                                 aria-pressed={tradeMode === value}
-                                                onClick={() => setTradeMode(value)}
+                                                onClick={() => handleModeSelect(value)}
                                                 className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
                                                     tradeMode === value
                                                         ? 'border-zinc-950 bg-zinc-950 text-white'
@@ -555,6 +911,199 @@
                                     </div>
                                 </div>
 
+                                {/* 方向切換 */}
+                                <div>
+                                    <span className={labelClass}>買賣方向</span>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {[
+                                            ['long', isMarginLong ? '做多 (融資買進)' : '做多 (先買後賣)'],
+                                            ['short', isMarginShort ? '做空 (融券賣出)' : '做空 (先賣後買)'],
+                                        ].map(([value, label]) => (
+                                            <button
+                                                key={value}
+                                                type="button"
+                                                aria-pressed={direction === value}
+                                                onClick={() => handleDirectionSelect(value)}
+                                                className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
+                                                    direction === value
+                                                        ? 'border-zinc-800 bg-zinc-800 text-white'
+                                                        : 'border-zinc-300 bg-white text-zinc-700 hover:border-zinc-500'
+                                                }`}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* 融資專屬參數 */}
+                                {isMarginLong && (
+                                    <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 space-y-3">
+                                        <div className="flex items-center justify-between">
+                                            <span className="text-xs font-bold uppercase tracking-wider text-amber-900">融資信用參數</span>
+                                            <span className="text-xs text-amber-700">千元向下取整</span>
+                                        </div>
+
+                                        <div>
+                                            <div className="flex justify-between items-center mb-1">
+                                                <label className="text-xs font-semibold text-zinc-700" htmlFor="marginSelfRatio">自備款成數 (%)</label>
+                                                <span className="text-xs text-zinc-500">融資成數 {100 - parseNumber(marginSelfRatio, 40)}%</span>
+                                            </div>
+                                            <input
+                                                id="marginSelfRatio"
+                                                type="number"
+                                                min="10"
+                                                max="100"
+                                                step="5"
+                                                inputMode="decimal"
+                                                value={marginSelfRatio}
+                                                onChange={(e) => setMarginSelfRatio(e.target.value)}
+                                                className={inputClass}
+                                                placeholder="預設 40"
+                                            />
+                                            <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+                                                {[['40', '40% (上市標準)'], ['50', '50% (上櫃)'], ['30', '30% (自訂)']].map(([val, label]) => (
+                                                    <button
+                                                        key={val}
+                                                        type="button"
+                                                        onClick={() => setMarginSelfRatio(val)}
+                                                        className={`rounded border px-1.5 py-1 text-xs font-medium transition ${marginSelfRatio === val ? 'border-amber-600 bg-amber-100 text-amber-900 font-bold' : 'border-zinc-300 bg-white text-zinc-600 hover:bg-zinc-50'}`}
+                                                    >
+                                                        {label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <div>
+                                                <label className="mb-1 block text-xs font-semibold text-zinc-700" htmlFor="marginInterestRate">融資年利率 (%)</label>
+                                                <input
+                                                    id="marginInterestRate"
+                                                    type="number"
+                                                    min="0"
+                                                    step="0.1"
+                                                    inputMode="decimal"
+                                                    value={marginInterestRate}
+                                                    onChange={(e) => setMarginInterestRate(e.target.value)}
+                                                    className={inputClass}
+                                                    placeholder="預設 4"
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className="mb-1 block text-xs font-semibold text-zinc-700" htmlFor="marginDays">融資天數 (天)</label>
+                                                <input
+                                                    id="marginDays"
+                                                    type="number"
+                                                    min="0"
+                                                    step="1"
+                                                    inputMode="numeric"
+                                                    value={marginDays}
+                                                    onChange={(e) => setMarginDays(e.target.value)}
+                                                    className={inputClass}
+                                                    placeholder="預設 30"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="flex flex-wrap gap-1 pt-0.5">
+                                            {['0', '7', '30', '60', '90', '180'].map((day) => (
+                                                <button
+                                                    key={day}
+                                                    type="button"
+                                                    onClick={() => setMarginDays(day)}
+                                                    className={`rounded border px-2 py-0.5 text-xs font-medium ${marginDays === day ? 'border-amber-600 bg-amber-100 text-amber-900 font-bold' : 'border-zinc-300 bg-white text-zinc-600 hover:bg-zinc-50'}`}
+                                                >
+                                                    {day === '0' ? '當日 (0天)' : `${day}天`}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* 融券專屬參數 */}
+                                {isMarginShort && (
+                                    <div className="rounded-lg border border-purple-200 bg-purple-50/60 p-3 space-y-3">
+                                        <div className="flex items-center justify-between">
+                                            <span className="text-xs font-bold uppercase tracking-wider text-purple-900">融券信用參數</span>
+                                            <span className="text-xs text-purple-700">百元向上進位</span>
+                                        </div>
+
+                                        <div>
+                                            <label className="mb-1 block text-xs font-semibold text-zinc-700" htmlFor="shortMarginRatio">保證金成數 (%)</label>
+                                            <input
+                                                id="shortMarginRatio"
+                                                type="number"
+                                                min="10"
+                                                max="200"
+                                                step="5"
+                                                inputMode="decimal"
+                                                value={shortMarginRatio}
+                                                onChange={(e) => setShortMarginRatio(e.target.value)}
+                                                className={inputClass}
+                                                placeholder="預設 90"
+                                            />
+                                            <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+                                                {[['90', '90% (標準成數)'], ['100', '100% (全額保證金)']].map(([val, label]) => (
+                                                    <button
+                                                        key={val}
+                                                        type="button"
+                                                        onClick={() => setShortMarginRatio(val)}
+                                                        className={`rounded border px-1.5 py-1 text-xs font-medium transition ${shortMarginRatio === val ? 'border-purple-600 bg-purple-100 text-purple-900 font-bold' : 'border-zinc-300 bg-white text-zinc-600 hover:bg-zinc-50'}`}
+                                                    >
+                                                        {label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <div>
+                                                <label className="mb-1 block text-xs font-semibold text-zinc-700" htmlFor="shortDays">融券天數 (天)</label>
+                                                <input
+                                                    id="shortDays"
+                                                    type="number"
+                                                    min="0"
+                                                    step="1"
+                                                    inputMode="numeric"
+                                                    value={shortDays}
+                                                    onChange={(e) => setShortDays(e.target.value)}
+                                                    className={inputClass}
+                                                    placeholder="預設 30"
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className="mb-1 block text-xs font-semibold text-zinc-700" htmlFor="shortFeeRate">借券費率 (%)</label>
+                                                <input
+                                                    id="shortFeeRate"
+                                                    type="number"
+                                                    min="0"
+                                                    step="0.01"
+                                                    inputMode="decimal"
+                                                    value={shortFeeRate}
+                                                    onChange={(e) => setShortFeeRate(e.target.value)}
+                                                    className={inputClass}
+                                                    placeholder="預設 0.08"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        <div className="flex flex-wrap gap-1 pt-0.5">
+                                            {['0', '7', '30', '60', '90'].map((day) => (
+                                                <button
+                                                    key={day}
+                                                    type="button"
+                                                    onClick={() => setShortDays(day)}
+                                                    className={`rounded border px-2 py-0.5 text-xs font-medium ${shortDays === day ? 'border-purple-600 bg-purple-100 text-purple-900 font-bold' : 'border-zinc-300 bg-white text-zinc-600 hover:bg-zinc-50'}`}
+                                                >
+                                                    {day === '0' ? '當日 (0天)' : `${day}天`}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* 商品類型 */}
                                 <div>
                                     <span className={labelClass}>商品類型</span>
                                     <div className="grid grid-cols-2 gap-2">
@@ -574,11 +1123,12 @@
                                             </button>
                                         ))}
                                     </div>
-                                    <div className="mt-2 text-xs text-zinc-500">
-                                        證交稅：{(resolveTaxRate(productType, tradeMode) * 100).toFixed(2)}%
+                                    <div className="mt-1.5 text-xs text-zinc-500">
+                                        證交稅：{(resolveTaxRate(productType, tradeMode, isMarginLong ? parseNumber(marginDays, 30) : (isMarginShort ? parseNumber(shortDays, 30) : 0)) * 100).toFixed(2)}%
                                     </div>
                                 </div>
 
+                                {/* 張數 */}
                                 <div>
                                     <label className={labelClass} htmlFor="lots">張數</label>
                                     <div className="flex">
@@ -611,6 +1161,7 @@
                                     </div>
                                 </div>
 
+                                {/* 進場價格 */}
                                 <div>
                                     <label className={labelClass} htmlFor="entryPrice">進場價格</label>
                                     <input
@@ -626,6 +1177,7 @@
                                     />
                                 </div>
 
+                                {/* 出場價格 */}
                                 <div>
                                     <label className={labelClass} htmlFor="exitPrice">出場價格</label>
                                     <input
@@ -637,10 +1189,11 @@
                                         value={exitPrice}
                                         onChange={(event) => setExitPrice(event.target.value)}
                                         className={inputClass}
-                                        placeholder="選填"
+                                        placeholder="選填，試算自訂出場"
                                     />
                                 </div>
 
+                                {/* 停損金額 */}
                                 <div>
                                     <label className={labelClass} htmlFor="stopLoss">停損金額</label>
                                     <input
@@ -656,6 +1209,7 @@
                                     />
                                 </div>
 
+                                {/* 手續費折數與最低手續費 */}
                                 <div className="grid grid-cols-2 gap-3">
                                     <div>
                                         <label className={labelClass} htmlFor="discount">手續費折數</label>
@@ -694,13 +1248,16 @@
                                             onClick={() => setDiscount(value)}
                                             className="rounded-md border border-zinc-300 bg-white px-2 py-2 text-sm font-semibold text-zinc-700 hover:border-zinc-500"
                                         >
-                                            {value}
+                                            {value === '0.18' ? '0.18 (1.8折)' : value}
                                         </button>
                                     ))}
                                 </div>
 
+                                {/* 目標淨利率 */}
                                 <div>
-                                    <label className={labelClass} htmlFor="targets">目標淨利率</label>
+                                    <label className={labelClass} htmlFor="targets">
+                                        目標淨利率 (%) {isCreditTrade && <span className="text-xs font-normal text-amber-700">（依自備款/保證金計算）</span>}
+                                    </label>
                                     <input
                                         id="targets"
                                         type="text"
@@ -713,6 +1270,7 @@
                             </div>
                         </section>
 
+                        {/* 右側試算結果 */}
                         <section className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm sm:p-5">
                             <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
                                 <div>
@@ -736,37 +1294,126 @@
                                 </div>
                             ) : (
                                 <div className="space-y-5">
+                                    {/* 頂部 Summary Cards */}
                                     <div className="grid overflow-hidden rounded-lg border border-zinc-200 sm:grid-cols-4">
+                                        {/* 欄位 1: 進場本金支出 */}
                                         <div className="border-b border-zinc-200 p-3 sm:border-b-0 sm:border-r">
                                             <div className="text-xs font-semibold text-zinc-500">
-                                                {results.direction === 'long' ? '進場總成本' : '進場總收入'}
+                                                {isMarginLong ? '自備款總支出' : (isMarginShort ? '保證金總支出' : (results.direction === 'long' ? '進場總成本' : '進場總收入'))}
                                             </div>
                                             <div className="mt-1 text-xl font-bold">{formatCurrency(results.entry.amount)}</div>
+                                            {isMarginLong && (
+                                                <div className="mt-0.5 text-xs text-zinc-400">融資金額 {formatCurrency(results.entry.marginLoan)}</div>
+                                            )}
+                                            {isMarginShort && (
+                                                <div className="mt-0.5 text-xs text-zinc-400">擔保款 {formatCurrency(results.entry.shortGuarantyFund)}</div>
+                                            )}
                                         </div>
+
+                                        {/* 欄位 2: 損益兩平價 */}
                                         <div className="border-b border-zinc-200 p-3 sm:border-b-0 sm:border-r">
                                             <div className="text-xs font-semibold text-zinc-500">損益兩平價</div>
                                             <div className={`mt-1 text-xl font-bold ${priceClass(results.entryPrice, results.breakEven.exitPrice)}`}>
                                                 {formatPrice(results.breakEven.exitPrice)}
                                             </div>
+                                            <div className="mt-0.5 text-xs text-zinc-400">
+                                                理論兩平 {formatPrice(results.breakEven.theoreticalPrice)}
+                                            </div>
                                         </div>
+
+                                        {/* 欄位 3: 兩平需跳動 */}
                                         <div className="border-b border-zinc-200 p-3 sm:border-b-0 sm:border-r">
                                             <div className="text-xs font-semibold text-zinc-500">兩平需跳動</div>
                                             <div className="mt-1 text-xl font-bold">{tickLabel(results.breakEven.ticks)}</div>
+                                            <div className="mt-0.5 text-xs text-zinc-400">
+                                                漲跌幅 {formatPercent((results.breakEven.exitPrice - results.entryPrice) / results.entryPrice)}
+                                            </div>
                                         </div>
+
+                                        {/* 欄位 4: 兩平總稅費與利息 */}
                                         <div className="p-3">
-                                            <div className="text-xs font-semibold text-zinc-500">兩平費稅</div>
+                                            <div className="text-xs font-semibold text-zinc-500">兩平總稅費</div>
                                             <div className="mt-1 text-xl font-bold">{formatCurrency(results.breakEven.totalFeesAndTax)}</div>
+                                            {isMarginLong && (
+                                                <div className="mt-0.5 text-xs text-amber-700">含融資息 {formatCurrency(results.breakEven.marginInterest)}</div>
+                                            )}
+                                            {isMarginShort && (
+                                                <div className="mt-0.5 text-xs text-purple-700">含借券費 {formatCurrency(results.breakEven.shortFee)}</div>
+                                            )}
                                         </div>
                                     </div>
 
+                                    {/* 信用交易：維持率與追繳價警示卡 (130% 斷頭追繳線) */}
+                                    {isCreditTrade && results.entry.marginCallPrice && (
+                                        <div className="rounded-lg border border-amber-300 bg-amber-50/80 p-3.5 shadow-sm">
+                                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                                <div>
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="inline-block h-2 w-2 rounded-full bg-amber-500"></span>
+                                                        <h3 className="text-sm font-bold text-amber-950">
+                                                            {isMarginLong ? '融資維持率與追繳價 (130% 追繳線)' : '融券維持率與追繳價 (130% 追繳線)'}
+                                                        </h3>
+                                                    </div>
+                                                    <p className="mt-0.5 text-xs text-amber-800">
+                                                        進場維持率 <span className="font-bold">{results.entry.initialMaintenanceRatio?.toFixed(1)}%</span>。
+                                                        {isMarginLong
+                                                            ? `市價跌破追繳價時，融資維持率將低於 130% 面臨追繳。`
+                                                            : `市價漲破追繳價時，融券維持率將低於 130% 面臨追繳。`
+                                                        }
+                                                    </p>
+                                                </div>
+                                                <div className="text-right">
+                                                    <div className="text-xs font-semibold text-amber-900">追繳價格</div>
+                                                    <div className="text-xl font-black text-amber-900">
+                                                        {formatPrice(results.entry.marginCallPrice)}
+                                                    </div>
+                                                    <div className="text-xs font-medium text-amber-700">
+                                                        {isMarginLong ? '跌幅' : '漲幅'} {formatPercent((results.entry.marginCallPrice - results.entryPrice) / results.entryPrice)}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* 明細 Cards */}
                                     <div className="grid gap-4 md:grid-cols-2">
-                                        <div className="rounded-lg border border-zinc-200 p-3">
-                                            <h3 className="text-sm font-bold text-zinc-700">進場明細</h3>
+                                        {/* Card 1: 進場交易明細 */}
+                                        <div className="rounded-lg border border-zinc-200 bg-white p-3.5 shadow-sm">
+                                            <div className="flex items-center justify-between border-b border-zinc-100 pb-2">
+                                                <h3 className="text-sm font-bold text-zinc-800">進場交易明細</h3>
+                                                <span className="text-xs font-semibold text-zinc-600 bg-zinc-100 px-2 py-0.5 rounded">
+                                                    進場價 {formatPrice(results.entryPrice)}
+                                                </span>
+                                            </div>
                                             <dl className="mt-3 space-y-2 text-sm">
                                                 <div className="flex justify-between gap-3">
-                                                    <dt className="text-zinc-500">成交金額</dt>
+                                                    <dt className="text-zinc-500">進場成交總額</dt>
                                                     <dd className="font-semibold">{formatCurrency(results.entry.gross)}</dd>
                                                 </div>
+                                                {isMarginLong && (
+                                                    <>
+                                                        <div className="flex justify-between gap-3">
+                                                            <dt className="text-zinc-500">融資金額 ({(100 - results.marginSelfRatio * 100).toFixed(0)}%)</dt>
+                                                            <dd className="font-semibold text-blue-700">{formatCurrency(results.entry.marginLoan)}</dd>
+                                                        </div>
+                                                        <div className="flex justify-between gap-3">
+                                                            <dt className="text-zinc-500">自備款本金 ({(results.marginSelfRatio * 100).toFixed(0)}%)</dt>
+                                                            <dd className="font-semibold">{formatCurrency(results.entry.selfMargin)}</dd>
+                                                        </div>
+                                                    </>
+                                                )}
+                                                {isMarginShort && (
+                                                    <>
+                                                        <div className="flex justify-between gap-3">
+                                                            <dt className="text-zinc-500">融券保證金 ({(results.shortMarginRatio * 100).toFixed(0)}%)</dt>
+                                                            <dd className="font-semibold text-purple-700">{formatCurrency(results.entry.shortCollateral)}</dd>
+                                                        </div>
+                                                        <div className="flex justify-between gap-3">
+                                                            <dt className="text-zinc-500">融券擔保價款</dt>
+                                                            <dd className="font-semibold">{formatCurrency(results.entry.shortGuarantyFund)}</dd>
+                                                        </div>
+                                                    </>
+                                                )}
                                                 <div className="flex justify-between gap-3">
                                                     <dt className="text-zinc-500">進場手續費</dt>
                                                     <dd className="font-semibold">{formatCurrency(results.entry.commission)}</dd>
@@ -775,30 +1422,149 @@
                                                     <dt className="text-zinc-500">進場證交稅</dt>
                                                     <dd className="font-semibold">{formatCurrency(results.entry.tax)}</dd>
                                                 </div>
+                                                <div className="flex justify-between gap-3 pt-2 border-t border-zinc-100 font-bold">
+                                                    <dt className="text-zinc-700">
+                                                        {isMarginLong ? '自備款實付總額' : (isMarginShort ? '保證金實付總額' : '進場實付總額')}
+                                                    </dt>
+                                                    <dd className="text-zinc-900">{formatCurrency(results.entry.amount)}</dd>
+                                                </div>
+                                                {isCreditTrade && results.entry.initialMaintenanceRatio !== null && (
+                                                    <div className="flex justify-between gap-3 text-xs text-zinc-500">
+                                                        <span>進場維持率</span>
+                                                        <span className="font-semibold text-zinc-700">{results.entry.initialMaintenanceRatio.toFixed(1)}%</span>
+                                                    </div>
+                                                )}
                                             </dl>
                                         </div>
 
-                                        <div className="rounded-lg border border-zinc-200 p-3">
-                                            <h3 className="text-sm font-bold text-zinc-700">費率設定</h3>
-                                            <dl className="mt-3 space-y-2 text-sm">
-                                                <div className="flex justify-between gap-3">
-                                                    <dt className="text-zinc-500">有效手續費率</dt>
-                                                    <dd className="font-semibold">{(results.feeRate * 100).toFixed(4)}%</dd>
+                                        {/* Card 2: 出場交易明細 */}
+                                        {(() => {
+                                            const exitObj = results.manualExit || results.breakEven;
+                                            const isManual = !!results.manualExit;
+                                            return (
+                                                <div className="rounded-lg border border-zinc-200 bg-white p-3.5 shadow-sm">
+                                                    <div className="flex items-center justify-between border-b border-zinc-100 pb-2">
+                                                        <h3 className="text-sm font-bold text-zinc-800">出場交易明細</h3>
+                                                        {isManual ? (
+                                                            <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                                                                自訂價 {formatPrice(exitObj.exitPrice)}
+                                                            </span>
+                                                        ) : (
+                                                            <span className="text-xs font-medium text-zinc-500 bg-zinc-100 px-2 py-0.5 rounded border border-zinc-200">
+                                                                兩平價 {formatPrice(exitObj.exitPrice)} (參考)
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <dl className="mt-3 space-y-2 text-sm">
+                                                        <div className="flex justify-between gap-3">
+                                                            <dt className="text-zinc-500">出場成交總額</dt>
+                                                            <dd className="font-semibold">{formatCurrency(exitObj.exitGross)}</dd>
+                                                        </div>
+                                                        {isMarginLong && (
+                                                            <>
+                                                                <div className="flex justify-between gap-3">
+                                                                    <dt className="text-zinc-500">償還融資金額</dt>
+                                                                    <dd className="font-semibold text-blue-700">-{formatCurrency(results.entry.marginLoan)}</dd>
+                                                                </div>
+                                                                <div className="flex justify-between gap-3">
+                                                                    <dt className="text-zinc-500">融資利息支出 ({results.marginDays} 天)</dt>
+                                                                    <dd className="font-semibold text-amber-800">-{formatCurrency(exitObj.marginInterest)}</dd>
+                                                                </div>
+                                                            </>
+                                                        )}
+                                                        {isMarginShort && (
+                                                            <>
+                                                                <div className="flex justify-between gap-3">
+                                                                    <dt className="text-zinc-500">融券借券手續費</dt>
+                                                                    <dd className="font-semibold text-purple-800">-{formatCurrency(exitObj.shortFee)}</dd>
+                                                                </div>
+                                                                <div className="flex justify-between gap-3">
+                                                                    <dt className="text-zinc-500">擔保金利息收入 ({results.shortDays} 天)</dt>
+                                                                    <dd className="font-semibold text-emerald-700">+{formatCurrency(exitObj.shortInterest)}</dd>
+                                                                </div>
+                                                            </>
+                                                        )}
+                                                        <div className="flex justify-between gap-3">
+                                                            <dt className="text-zinc-500">出場手續費</dt>
+                                                            <dd className="font-semibold">{formatCurrency(exitObj.exitCommission)}</dd>
+                                                        </div>
+                                                        <div className="flex justify-between gap-3">
+                                                            <dt className="text-zinc-500">出場證交稅</dt>
+                                                            <dd className="font-semibold">{formatCurrency(exitObj.exitTax)}</dd>
+                                                        </div>
+                                                        <div className="flex justify-between gap-3 pt-2 border-t border-zinc-100 font-bold">
+                                                            <dt className="text-zinc-700">
+                                                                {isMarginLong ? '融資賣出應收退款' : (isMarginShort ? '融券退還保證金與損益' : '出場交割應收金額')}
+                                                            </dt>
+                                                            <dd className="text-zinc-900">{formatCurrency(exitObj.exitAmount)}</dd>
+                                                        </div>
+                                                        <div className="flex justify-between gap-3 pt-1 text-sm font-bold">
+                                                            <dt className="text-zinc-700">預估淨損益</dt>
+                                                            <dd className={profitClass(exitObj.profit)}>{formatSignedCurrency(exitObj.profit)}</dd>
+                                                        </div>
+                                                        {isCreditTrade && exitObj.maintenanceRatio !== null && (
+                                                            <div className="flex justify-between gap-3 text-xs text-zinc-500">
+                                                                <span>出場維持率</span>
+                                                                <span className={`font-semibold ${exitObj.maintenanceRatio < 130 ? 'text-red-600 font-bold' : 'text-zinc-700'}`}>
+                                                                    {exitObj.maintenanceRatio.toFixed(1)}% {exitObj.maintenanceRatio < 130 && '(⚠️ 低於 130% 追繳線)'}
+                                                                </span>
+                                                            </div>
+                                                        )}
+                                                    </dl>
                                                 </div>
-                                                <div className="flex justify-between gap-3">
-                                                    <dt className="text-zinc-500">證交稅率</dt>
-                                                    <dd className="font-semibold">{(results.taxRate * 100).toFixed(2)}%</dd>
-                                                </div>
-                                                <div className="flex justify-between gap-3">
-                                                    <dt className="text-zinc-500">計算股數</dt>
-                                                    <dd className="font-semibold">{results.shares.toLocaleString('zh-TW')}</dd>
-                                                </div>
-                                            </dl>
-                                        </div>
+                                            );
+                                        })()}
                                     </div>
 
+                                    {/* 費率與條件 */}
+                                    <div className="rounded-lg border border-zinc-200 bg-zinc-50/70 p-3.5">
+                                        <h3 className="text-sm font-bold text-zinc-700">費率與交易條件</h3>
+                                        <dl className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                                            <div>
+                                                <dt className="text-xs text-zinc-500">有效手續費率</dt>
+                                                <dd className="mt-0.5 font-semibold text-zinc-800">{(results.feeRate * 100).toFixed(4)}%</dd>
+                                            </div>
+                                            <div>
+                                                <dt className="text-xs text-zinc-500">證交稅率</dt>
+                                                <dd className="mt-0.5 font-semibold text-zinc-800">{(results.taxRate * 100).toFixed(2)}%</dd>
+                                            </div>
+                                            {isMarginLong && (
+                                                <div>
+                                                    <dt className="text-xs text-zinc-500">融資利率 / 天數</dt>
+                                                    <dd className="mt-0.5 font-semibold text-amber-800">{(results.marginInterestRate * 100).toFixed(1)}% / {results.marginDays} 天</dd>
+                                                </div>
+                                            )}
+                                            {isMarginShort && (
+                                                <div>
+                                                    <dt className="text-xs text-zinc-500">借券費率 / 天數</dt>
+                                                    <dd className="mt-0.5 font-semibold text-purple-800">{(results.shortFeeRate * 100).toFixed(2)}% / {results.shortDays} 天</dd>
+                                                </div>
+                                            )}
+                                            {!isCreditTrade && (
+                                                <div>
+                                                    <dt className="text-xs text-zinc-500">交易模式</dt>
+                                                    <dd className="mt-0.5 font-semibold text-zinc-800">{tradeMode === 'dayTrade' ? '現股當沖 (降稅 0.15%)' : '現股一般 (0.3%)'}</dd>
+                                                </div>
+                                            )}
+                                            <div>
+                                                <dt className="text-xs text-zinc-500">計算總股數</dt>
+                                                <dd className="mt-0.5 font-semibold text-zinc-800">{results.shares.toLocaleString('zh-TW')} {results.product.unitLabel} ({results.lots} 張)</dd>
+                                            </div>
+                                        </dl>
+                                    </div>
+
+                                    {/* 自訂出場價格試算 */}
                                     {results.manualExit && (
-                                        <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3">
+                                        <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3.5">
+                                            <div className="mb-2 flex items-center justify-between border-b border-zinc-200 pb-2">
+                                                <span className="text-sm font-bold text-zinc-800">自訂出場試算</span>
+                                                {results.manualExit.maintenanceRatio !== null && (
+                                                    <span className={`text-xs font-semibold px-2 py-0.5 rounded ${results.manualExit.maintenanceRatio < 130 ? 'bg-red-100 text-red-800' : 'bg-zinc-200 text-zinc-700'}`}>
+                                                        出場維持率 {results.manualExit.maintenanceRatio.toFixed(1)}%
+                                                        {results.manualExit.maintenanceRatio < 130 && ' ⚠️ 低於 130% 追繳線'}
+                                                    </span>
+                                                )}
+                                            </div>
                                             <div className="grid gap-3 sm:grid-cols-5">
                                                 <div>
                                                     <div className="text-xs font-semibold text-zinc-500">出場可掛價</div>
@@ -811,25 +1577,45 @@
                                                     <div className="mt-1 text-lg font-bold">{tickLabel(results.manualExit.ticks)}</div>
                                                 </div>
                                                 <div>
-                                                    <div className="text-xs font-semibold text-zinc-500">來回費稅</div>
+                                                    <div className="text-xs font-semibold text-zinc-500">來回費稅與利息</div>
                                                     <div className="mt-1 text-lg font-bold">{formatCurrency(results.manualExit.totalFeesAndTax)}</div>
                                                 </div>
                                                 <div>
-                                                    <div className="text-xs font-semibold text-zinc-500">預估獲利</div>
-                                                    <div className={`mt-1 text-lg font-bold ${profitClass(results.manualExit.grossProfit)}`}>
-                                                        {formatSignedCurrency(results.manualExit.grossProfit)}
-                                                    </div>
-                                                </div>
-                                                <div>
-                                                    <div className="text-xs font-semibold text-zinc-500">預估損益</div>
+                                                    <div className="text-xs font-semibold text-zinc-500">預估淨損益</div>
                                                     <div className={`mt-1 text-lg font-bold ${profitClass(results.manualExit.profit)}`}>
                                                         {formatSignedCurrency(results.manualExit.profit)}
                                                     </div>
                                                 </div>
+                                                <div>
+                                                    <div className="text-xs font-semibold text-zinc-500">
+                                                        {isCreditTrade ? '自備款投報率' : '淨報酬率'}
+                                                    </div>
+                                                    <div className={`mt-1 text-lg font-bold ${profitClass(results.manualExit.profit)}`}>
+                                                        {formatPercent(results.manualExit.returnRate)}
+                                                    </div>
+                                                    {isCreditTrade && (
+                                                        <div className="text-xs text-zinc-400">
+                                                            名目 {formatPercent(results.manualExit.nominalReturnRate)}
+                                                        </div>
+                                                    )}
+                                                </div>
                                             </div>
+                                            {isMarginLong && (
+                                                <div className="mt-2.5 pt-2 border-t border-zinc-200 text-xs text-zinc-600 flex justify-between">
+                                                    <span>融資賣出應收退款（扣除融資金額與利息後）：</span>
+                                                    <span className="font-bold text-zinc-900">{formatCurrency(results.manualExit.exitAmount)} 元</span>
+                                                </div>
+                                            )}
+                                            {isMarginShort && (
+                                                <div className="mt-2.5 pt-2 border-t border-zinc-200 text-xs text-zinc-600 flex justify-between">
+                                                    <span>融券回補結算退回保證金與損益：</span>
+                                                    <span className="font-bold text-zinc-900">{formatCurrency(results.manualExit.exitAmount)} 元</span>
+                                                </div>
+                                            )}
                                         </div>
                                     )}
 
+                                    {/* 停損價 Card */}
                                     {results.stopLoss && (
                                         <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3">
                                             <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
@@ -844,15 +1630,20 @@
                                         </div>
                                     )}
 
+                                    {/* 目標報酬率表格 */}
                                     <div className="overflow-x-auto rounded-lg border border-zinc-200">
                                         <table className="w-full min-w-[720px] border-collapse text-left text-sm">
                                             <thead className="bg-zinc-50 text-xs uppercase tracking-wide text-zinc-500">
                                                 <tr>
-                                                    <th className="border-b border-zinc-200 px-3 py-2">目標</th>
+                                                    <th className="border-b border-zinc-200 px-3 py-2">
+                                                        {isCreditTrade ? '自備款目標' : '目標'}
+                                                    </th>
                                                     <th className="border-b border-zinc-200 px-3 py-2">理論價</th>
                                                     <th className="border-b border-zinc-200 px-3 py-2">可掛價</th>
                                                     <th className="border-b border-zinc-200 px-3 py-2">檔數</th>
-                                                    <th className="border-b border-zinc-200 px-3 py-2">實際淨利率</th>
+                                                    <th className="border-b border-zinc-200 px-3 py-2">
+                                                        {isCreditTrade ? '自備款淨利率' : '實際淨利率'}
+                                                    </th>
                                                     <th className="border-b border-zinc-200 px-3 py-2 text-right">預估損益</th>
                                                 </tr>
                                             </thead>
@@ -883,12 +1674,13 @@
                                         </table>
                                     </div>
 
+                                    {/* 階梯上下檔位表 */}
                                     {priceLadder && (
                                         <div className="overflow-hidden rounded-lg border border-zinc-200">
                                             <div className="flex flex-col gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
                                                 <div>
-                                                    <h3 className="text-sm font-bold text-zinc-800">預設上下十檔</h3>
-                                                    <p className="text-xs text-zinc-500">以進場有效價為基準，顯示上下檔位的費稅與損益變化</p>
+                                                    <h3 className="text-sm font-bold text-zinc-800">預設上下十檔階梯</h3>
+                                                    <p className="text-xs text-zinc-500">以進場有效價為基準，顯示上下檔位的費稅、利息與損益變化</p>
                                                 </div>
                                                 <div className="flex flex-wrap gap-2">
                                                     <button
@@ -914,9 +1706,11 @@
                                                     <thead className="sticky top-0 z-10 bg-white text-xs uppercase tracking-wide text-zinc-500 shadow-sm">
                                                         <tr>
                                                             <th className="border-b border-zinc-200 bg-white px-3 py-2">價格</th>
-                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2">總稅費</th>
+                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2">總稅費與息</th>
                                                             <th className="border-b border-zinc-200 bg-white px-3 py-2 text-right">預估損益</th>
-                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2 text-right">報酬率</th>
+                                                            <th className="border-b border-zinc-200 bg-white px-3 py-2 text-right">
+                                                                {isCreditTrade ? '自備款報酬率' : '報酬率'}
+                                                            </th>
                                                         </tr>
                                                     </thead>
                                                     <tbody>
@@ -978,7 +1772,7 @@
                                         </div>
                                     )}
                                     <p className="text-xs leading-5 text-zinc-500">
-                                        升降單位依臺灣證券交易所集中市場規則估算；個股當沖證交稅以千分之 1.5、個股非當沖以千分之 3、一般 ETF 以千分之 1 試算。特殊商品與手續費、稅額取整仍以券商成交回報為準。
+                                        升降單位依臺灣證券交易所集中市場規則估算；個股當沖證交稅千分之 1.5、個股一般與信用非當沖千分之 3、ETF 千分之 1。融資金額依規定採千元整數無條件捨去、融券保證金採百元整數進位。實際手續費、利息與交割金額仍以券商成交回報為準。
                                     </p>
                                 </div>
                             )}
