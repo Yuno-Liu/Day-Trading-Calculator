@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="台股計算機">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b344d"/>
+      <stop offset="1" stop-color="#070910"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <g fill="#2ed573">
+    <rect x="18.5" y="29" width="3" height="20" rx="1.5"/>
+    <rect x="15" y="33" width="10" height="12" rx="1.5"/>
+  </g>
+  <g fill="#ff4d4f">
+    <rect x="30.5" y="22" width="3" height="21" rx="1.5"/>
+    <rect x="27" y="26" width="10" height="14" rx="1.5"/>
+    <rect x="42.5" y="15" width="3" height="20" rx="1.5"/>
+    <rect x="39" y="18" width="10" height="13" rx="1.5"/>
+  </g>
+</svg>
