@@ -663,8 +663,13 @@ describe('規則：組合驗證與輸入清洗', () => {
   });
 
   test('[API] 版本、預設值、台北日期', () => {
-    assert.equal(T.VERSION, '2.0.0');
+    assert.equal(T.VERSION, '2.1.0');
     const d = T.getDefaults();
+    assert.equal(d.market, 'tw');
+    assert.equal(d.usFeeRate, '0.08');
+    assert.equal(d.usMinFee, '0');
+    assert.equal(d.usSecFeeRate, '0.00206');
+    assert.equal(d.usTafEnabled, 'off');
     assert.equal(d.tradeMode, 'marginLong');
     assert.equal(d.marginInterestRate, '6.45');
     assert.equal(d.shortMarginRatio, '');
@@ -1341,5 +1346,131 @@ describe('自我對帳', () => {
     }
     t.diagnostic(`情境 ${stats.scenarios}、檢查交易 ${stats.trades} 筆（含維持率 ${stats.maint} 筆）、兩平可達 ${stats.beReachable}／不可達 ${stats.beUnreachable}、目標不可達 ${stats.targetsUnreachable}、月退制情境 ${stats.monthly}`);
     assert.equal(stats.scenarios, 5000);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+// 美股複委託（玉山證券預設：0.08%、免低收、SEC Fee 0.00206%）
+// ════════════════════════════════════════════════════════════════════
+describe('美股複委託計算', () => {
+  const calcUs = (over) => T.calculate({ ...T.getDefaults(), market: 'us', ...over });
+
+  test('[玉山預設] 100 股 @ $100 → 出場 $105：買進手續費 $8.00、賣出手續費 $8.40、SEC Fee $0.22（進位）、淨損益 $483.38', () => {
+    // 買進 G = $10,000.00；手續費 = round(10,000 × 0.08%) = $8.00；進場應付 = $10,008.00
+    // 賣出 EG = $10,500.00；手續費 = round(10,500 × 0.08%) = $8.40
+    // SEC Fee = ceil(10,500 × 0.00206%) = ceil(0.2163) = $0.22
+    // 來回總成本 = 8.00 + 8.40 + 0.22 = $16.62；賣出應收 = 10,500 − 8.40 − 0.22 = $10,491.38
+    // 淨損益 = 10,491.38 − 10,008.00 = $483.38
+    const r = calcUs({ usShares: '100', entryPrice: '100', exitPrice: '105' });
+    assert.equal(r.ok, true);
+    assert.equal(r.market, 'us');
+    assert.equal(r.currency, 'USD');
+    assert.equal(r.shares, 100);
+    assert.equal(r.entry.gross, 10000);
+    assert.equal(r.entry.commission.net, 8);
+    assert.equal(r.entry.tax, 0);
+    assert.equal(r.entry.cashOut, 10008);
+    assert.equal(r.entry.capitalBase, 10008);
+    const x = r.manualExit;
+    assert.equal(x.exitGross, 10500);
+    assert.equal(x.exitCommission.net, 8.4);
+    assert.equal(x.exitTax, 0.22);
+    assert.equal(x.exitTaf, 0);
+    assert.equal(x.totalCosts, 16.62);
+    assert.equal(x.settlement.amount, 10491.38);
+    assert.equal(x.profit, 483.38);
+    assert.equal(Math.round((x.settlement.amount - r.entry.cashOut) * 100), Math.round(x.profit * 100));
+    assert.equal(r.tax.label, 'SEC Fee 0.00206%（僅賣出）');
+  });
+
+  test('[玉山免低收] 小額交易 1 股 @ $10 → 出場 $10.03：手續費 $0.01、SEC Fee 最低 $0.01', () => {
+    // 買進 G = $10.00；手續費 = round(10 × 0.08%) = round(0.008) = $0.01；進場應付 = $10.01
+    // 賣出 $10.03：手續費 = round(10.03 × 0.08%) = round(0.008024) = $0.01；SEC = ceil(10.03 × 0.00206%) = $0.01
+    // 淨損益 = 10.03 − 10.00 − 0.01 − 0.01 − 0.01 = $0.00 → 兩平價恰為 $10.03（+3 檔）
+    const r = calcUs({ usShares: '1', entryPrice: '10' });
+    assert.equal(r.ok, true);
+    assert.equal(r.entry.commission.net, 0.01);
+    assert.equal(r.breakEven.exitPrice, 10.03);
+    assert.equal(r.breakEven.ticks, 3);
+    assert.equal(r.breakEven.profit, 0);
+    const prev = calcUs({ usShares: '1', entryPrice: '10', exitPrice: '10.02' });
+    assert.equal(prev.manualExit.profit, -0.01);
+  });
+
+  test('[自訂低消與 TAF] 手續費 0.1%、低消 $3、開啟 TAF（含 $9.79 上限）', () => {
+    // 100 股 @ $100 → 出場 $100：買進費 max($10, $3)=$10；賣出費 $10；SEC ceil($0.206)=$0.21；TAF ceil(100×0.000195)=$0.02
+    const r = calcUs({ usShares: '100', entryPrice: '100', exitPrice: '100', usFeeRate: '0.1', usMinFee: '3', usTafEnabled: 'on' });
+    assert.equal(r.entry.commission.net, 10);
+    assert.equal(r.manualExit.exitTax, 0.21);
+    assert.equal(r.manualExit.exitTaf, 0.02);
+    assert.equal(r.manualExit.totalCosts, 20.23);
+    // 低消生效：10 股 @ $100 → G = $1,000，0.1% = $1 < $3 → 收 $3
+    const rMin = calcUs({ usShares: '10', entryPrice: '100', exitPrice: '100', usFeeRate: '0.1', usMinFee: '3' });
+    assert.equal(rMin.entry.commission.net, 3);
+    assert.equal(rMin.manualExit.exitCommission.net, 3);
+    // TAF 上限 $9.79：100,000 股 × $0.000195 = $19.50 → 上限 $9.79
+    const rCap = calcUs({ usShares: '100000', entryPrice: '10', exitPrice: '10', usTafEnabled: 'on' });
+    assert.equal(rCap.manualExit.exitTaf, 9.79);
+  });
+
+  test('[美股做空模擬] 先賣後買：進場收 SEC Fee 與 TAF、出場只收買進手續費、對帳恆等式成立', () => {
+    // 100 股 @ $100 賣出 → $95 回補：
+    // 進場：費 $8.00、SEC $0.21、TAF $0.02；進場實收 = 10,000 − 8.23 = $9,991.77
+    // 出場：EG = $9,500.00、費 $7.60；回補應付 = −$9,507.60
+    // 淨損益 = 500 − 8.00 − 0.21 − 0.02 − 7.60 = $484.17 = 9,991.77 − 9,507.60
+    const r = calcUs({ usDirection: 'short', usShares: '100', entryPrice: '100', exitPrice: '95', usTafEnabled: 'on' });
+    assert.equal(r.ok, true);
+    assert.equal(hasWarn(r, 'US_SHORT_NOTE'), true);
+    assert.equal(r.entry.tax, 0.21);
+    assert.equal(r.entry.taf, 0.02);
+    assert.equal(r.entry.cashIn, 9991.77);
+    assert.equal(r.manualExit.exitTax, 0);
+    assert.equal(r.manualExit.exitTaf, 0);
+    assert.equal(r.manualExit.settlement.amount, -9507.6);
+    assert.equal(r.manualExit.profit, 484.17);
+    assert.equal(Math.round((r.entry.cashIn + r.manualExit.settlement.amount) * 100), Math.round(r.manualExit.profit * 100));
+  });
+
+  test('[美股停損、目標價、階梯與 USD 格式化] 精確反推與 $0.01 升降單位', () => {
+    const r = calcUs({ usShares: '10', entryPrice: '150', stopLoss: '50', usFxRate: '32.5' });
+    assert.equal(r.ok, true);
+    assert.equal(r.fxRate, 32.5);
+    assert.equal(r.stopLoss.reachable, true);
+    assert.ok(r.stopLoss.profit >= -50);
+    // 前一檔（低 $0.01）應虧損超過 $50
+    const prevSl = calcUs({ usShares: '10', entryPrice: '150', exitPrice: String(T.addTick(r.stopLoss.exitPrice, -1, 'us')) });
+    assert.ok(prevSl.manualExit.profit < -50);
+    // 目標價皆滿足 profit >= desiredProfit
+    for (const tg of r.targets) {
+      assert.equal(tg.reachable, true);
+      assert.ok(tg.profit >= tg.desiredProfit);
+    }
+    // 價格階梯：上下各 5 檔，每檔差 $0.01
+    const lad = T.buildLadder(r, { up: 5, down: 5 });
+    assert.equal(lad.rows.length, 11);
+    assert.equal(lad.rows[0].exitPrice, 150.05);
+    assert.equal(lad.rows[5].isEntry, true);
+    assert.equal(lad.rows[10].exitPrice, 149.95);
+    // tick 工具與 USD 格式化
+    assert.equal(T.getTickSize(150, 'us'), 0.01);
+    assert.equal(T.addTick(150, 1, 'us'), 150.01);
+    assert.equal(T.format.usd(1234.5), '$1,234.50');
+    assert.equal(T.format.usd(-0), '$0.00');
+    assert.equal(T.format.signedUsd(12.34), '+$12.34');
+    assert.equal(T.format.signedUsd(-12.34), '-$12.34');
+    assert.equal(T.format.signedUsd(0), '$0.00');
+    assert.equal(T.format.ratio(0.0000206), '0.00206%');
+  });
+
+  test('[美股輸入驗證] 缺失、範圍外、非整數股數與匯率異常', () => {
+    assert.equal(calcUs({ entryPrice: '' }).ok, false);
+    assert.equal(calcUs({ entryPrice: '100', usShares: '0' }).ok, false);
+    assert.equal(calcUs({ entryPrice: '1000001', usShares: '1' }).ok, false);
+    const r = calcUs({ entryPrice: '100.006', usShares: '10.6', usFxRate: 'abc' });
+    assert.equal(r.ok, true);
+    assert.equal(r.entryPrice, 100.01);
+    assert.equal(r.shares, 11);
+    assert.equal(r.fxRate, null);
+    assert.ok(hasWarn(r, 'ENTRY_ADJUSTED') && hasWarn(r, 'NON_INTEGER_SHARES') && hasWarn(r, 'FX_RATE_INVALID'));
   });
 });

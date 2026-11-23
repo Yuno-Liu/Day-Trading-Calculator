@@ -10,7 +10,7 @@
 'use strict';
 
 const CACHE_PREFIX = 'twcalc-';
-const CACHE = 'twcalc-v2.0.0';
+const CACHE = 'twcalc-v2.1.0';
 const NAV_TIMEOUT_MS = 3000;
 
 const LOCAL_ASSETS = [
