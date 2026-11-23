@@ -7,10 +7,10 @@
 <meta name="format-detection" content="telephone=no">
 <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
-<meta name="apple-mobile-web-app-title" content="台股計算機">
+<meta name="apple-mobile-web-app-title" content="台美股計算機">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="description" content="台股現股當沖、現股、融資、融券、資券當沖的手續費、證交稅、利息、兩平價、追繳價與損益試算">
-<title>台股當沖・融資融券計算機</title>
+<meta name="description" content="台股現股當沖、現股、融資、融券、資券當沖，以及美股複委託（玉山證券 0.08% 免低收）的手續費、證交稅、SEC Fee、利息、兩平價、追繳價與損益試算">
+<title>台美股交易計算機｜當沖・融資融券・美股複委託</title>
 <script>
   // manifest 只在 http/https 掛上：WebKit 以 CORS 抓 manifest，file://（origin null）會在主控台報錯
   if (location.protocol === 'http:' || location.protocol === 'https:') {
@@ -487,7 +487,7 @@
 <div class="status-plate" aria-hidden="true"></div>
 <div id="root">
   <div class="boot" role="status" aria-live="polite">
-    <p class="boot-title">台股當沖・融資融券計算機</p>
+    <p class="boot-title">台美股交易計算機</p>
     <p class="boot-msg" id="boot-msg">載入中…</p>
     <div class="boot-card"></div>
     <div class="boot-card"></div>
@@ -509,18 +509,24 @@
   // ════════════════════════════════════════════════════════════════════
   // 0. 常數
   // ════════════════════════════════════════════════════════════════════
-  const VERSION = '2.0.0';
-  const DATA_AS_OF = '2026-11-06';
+  const VERSION = '2.1.0';
+  const DATA_AS_OF = '2026-11-24';
 
   const FEE_BASE_N = 1425n;            // 手續費上限 0.1425% = 1425 / 1e6
   const MICRO = 1000000n;              // 1e6
   const R4 = 10000n;                   // 成數精度 1e-4
   const R6 = 1000000n;                 // 年利率精度 1e-6
-  const R8 = 100000000n;               // 融券手續費率、證交稅覆寫精度 1e-8
+  const R8 = 100000000n;               // 融券手續費率、證交稅覆寫、美股手續費率精度 1e-8
+  const R10 = 10000000000n;            // 美股 SEC Fee 精度 1e-10（百分比小數點後 8 位）
 
-  const PRICE_MAX_CENTS = 10000000;    // 輸入價格上限 100,000 元
-  const LOTS_MAX = 100000;             // 張數上限
-  const SEARCH_MAX_CENTS = 1000000000; // 反推搜尋價格上限 10,000,000 元（兩種級距表皆為合法價）
+  const PRICE_MAX_CENTS = 10000000;    // 台股輸入價格上限 100,000 元
+  const US_PRICE_MAX_CENTS = 100000000;// 美股輸入價格上限 1,000,000 美元
+  const LOTS_MAX = 100000;             // 台股張數上限
+  const US_SHARES_MAX = 1000000;       // 美股股數上限
+  const US_TAF_CAP_CENTS = 979n;       // FINRA TAF 單筆上限 $9.79
+  const US_TAF_NUM = 195n;             // FINRA TAF $0.000195/股 = 195/10000 美分/股
+  const US_TAF_DEN = 10000n;
+  const SEARCH_MAX_CENTS = 1000000000; // 反推搜尋價格上限 10,000,000 元／美元（各級距表皆為合法價）
   const GRID_MAX_CENTS = 1000000000000;// tick 工具可處理上限
   const GRID_MAX_CENTS_B = BigInt(GRID_MAX_CENTS);
   const MAX_TARGETS = 12;
@@ -709,6 +715,7 @@
   const TICK_TABLES = Object.freeze({
     stock: buildTickTable([[1, 1000, 1], [1000, 5000, 5], [5000, 10000, 10], [10000, 50000, 50], [50000, 100000, 100], [100000, Infinity, 500]]),
     etf: buildTickTable([[1, 5000, 1], [5000, Infinity, 5]]),
+    us: buildTickTable([[1, Infinity, 1]]),
   });
 
   function bandOf(table, pc) {
@@ -762,6 +769,7 @@
     return dc <= df ? c : f;
   }
   function tableFor(productType) {
+    if (productType === 'us') return TICK_TABLES.us;
     const p = PRODUCTS[productType];
     return p ? TICK_TABLES[p.tickTable] : null;
   }
@@ -1008,6 +1016,30 @@
     priceMax: PRICE_MAX_CENTS / 100,
     lotsMax: LOTS_MAX,
     notModeled: ['融券除權息強制回補與股利支付', '標借費、議借費、借券費', '處置股保證金加成', '整戶擔保品抵繳與多部位整戶維持率', '零股交易'],
+    us: {
+      brokerRef: '玉山證券複委託',
+      brokerUrl: 'https://www.esunsec.com.tw/campaign/trade-fee-foreign',
+      defaultFeeRate: 0.08,
+      feeRatePresets: [0.08, 0.1, 0.15, 0.25],
+      defaultMinFee: 0,
+      minFeePresets: [0, 1, 3, 15],
+      feeRounding: '買賣各收，四捨五入至 0.01 美元',
+      defaultSecFeeRate: 0.00206,
+      secFeePresets: [0.00206, 0],
+      secFeeNote: '僅賣出收取，無條件進位至 0.01 美元（不足 0.01 美元以 0.01 美元計）',
+      tafRatePerShare: 0.000195,
+      tafMaxUsd: 9.79,
+      tafNote: 'FINRA 交易活動費：僅賣出收取，每股 $0.000195、無條件進位至 $0.01、單筆上限 $9.79（玉山證券官網牌告未另列，預設關閉）',
+      tickSize: 0.01,
+      priceMax: US_PRICE_MAX_CENTS / 100,
+      sharesMax: US_SHARES_MAX,
+      notes: [
+        '預設費率優先參考玉山證券美股複委託：牌告手續費 0.08%、免低收、賣出交易徵費（SEC Fee）0.00206%',
+        '美股無漲跌幅限制；升降單位以 0.01 美元計（未滿 1 美元之 0.0001 美元級距未另細分）',
+        '台灣複委託目前僅支援現股買進→賣出（含當沖先買後賣），不支援放空；先賣後買僅供海外券商或模擬試算',
+        '未納入計算：法國 ADR 買進金融交易稅 0.3%（低消 $0.01）、義大利 ADR 買進 0.1%（低消 $0.01）、ADR 保管費（每股 $0.02–$0.05）、現金股利預扣稅（30%）、換匯價差',
+      ],
+    },
   });
 
   // ════════════════════════════════════════════════════════════════════
@@ -1036,8 +1068,8 @@
     return { r8 };
   }
 
-  /** 有理數分數 → 精簡百分比字串（例：100000/1e8 → '0.1%'） */
-  const ratePctLabel = (n, d) => `${scaledToPlain(divRoundHalfUp(n * 1000000n, d), 4)}%`;
+  /** 有理數分數 → 精簡百分比字串（最多 6 位小數，去尾零；例：100000/1e8 → '0.1%'、206000/1e10 → '0.00206%'） */
+  const ratePctLabel = (n, d) => `${scaledToPlain(divRoundHalfUp(n * 100000000n, d), 6)}%`;
 
   /** 內部：回傳 {n, d, rate, label, note, overridden, warnings[]} */
   function resolveTaxInternal(productType, tradeMode, tradeDate, taxRateOverride) {
@@ -1197,6 +1229,20 @@
     if (r === 0n) return '0';
     return (r > 0n ? '+' : '-') + fmtScaled(r > 0n ? r : -r, 0, true);
   }
+  function fmtUsd(v) {
+    if (v === null || v === undefined) return '--';
+    const r = roundForDisplay(v, 2);
+    if (r === null) return '--';
+    if (r === 0n) return '$0.00';
+    return (r < 0n ? '-$' : '$') + fmtScaled(r < 0n ? -r : r, 2, true);
+  }
+  function fmtSignedUsd(v) {
+    if (v === null || v === undefined) return '--';
+    const r = roundForDisplay(v, 2);
+    if (r === null) return '--';
+    if (r === 0n) return '$0.00';
+    return (r > 0n ? '+$' : '-$') + fmtScaled(r > 0n ? r : -r, 2, true);
+  }
   function fmtPrice(v) {
     if (v === null || v === undefined) return '--';
     const r = roundForDisplay(v, 2);
@@ -1211,12 +1257,12 @@
     const sign = r > 0n ? (opts && opts.signed ? '+' : '') : '-';
     return sign + fmtScaled(r > 0n ? r : -r, digits, true) + '%';
   }
-  /** 分數 → 精簡百分比（最多 4 位小數，去尾零）：1.3 → '130%'、0.001425 → '0.1425%' */
+  /** 分數 → 精簡百分比（最多 6 位小數，去尾零）：1.3 → '130%'、0.001425 → '0.1425%'、0.0000206 → '0.00206%' */
   function fmtRatio(v) {
     if (v === null || v === undefined) return '--';
-    const r = roundForDisplay(v, 6);
+    const r = roundForDisplay(v, 8);
     if (r === null) return '--';
-    const parts = scaledToPlain(r < 0n ? -r : r, 4).split('.');
+    const parts = scaledToPlain(r < 0n ? -r : r, 6).split('.');
     return (r < 0n ? '-' : '') + groupDigits(parts[0]) + (parts[1] ? '.' + parts[1] : '') + '%';
   }
   /** 維持率（%數值）→ '166.66%'：向下截斷到 0.01%，不進位（129.996 顯示 129.99%，不會誤讀為已達 130%） */
@@ -1234,6 +1280,8 @@
   const format = Object.freeze({
     currency: fmtCurrency,
     signedCurrency: fmtSignedCurrency,
+    usd: fmtUsd,
+    signedUsd: fmtSignedUsd,
     price: fmtPrice,
     percent: fmtPercent,
     ratio: fmtRatio,
@@ -1248,6 +1296,7 @@
   const DEFAULT_TARGETS = '3, 2.5, 2, 1, 0, -1, -2';
   function getDefaults() {
     return {
+      market: 'tw',
       tradeMode: 'marginLong', direction: 'long', productType: 'stock', lots: '10',
       entryPrice: '', exitPrice: '', stopLoss: '', refPrice: '', limitPct: '0.1',
       discount: '0.18', minFee: '20', feeModel: 'instant', taxRounding: 'floor', taxRateOverride: '',
@@ -1255,6 +1304,9 @@
       marginSelfRatio: '40', marginInterestRate: '6.45', marginDays: '30',
       shortMarginRatio: '', shortFeeRate: '0.08', shortInterestRate: '0.2', shortDays: '30',
       targets: DEFAULT_TARGETS,
+      // 美股複委託（預設參考玉山證券：0.08% 免低收、SEC Fee 0.00206%）
+      usDirection: 'long', usShares: '10', usFeeRate: '0.08', usMinFee: '0',
+      usSecFeeRate: '0.00206', usTafEnabled: 'off', usFxRate: '',
     };
   }
   /** 目標淨利率清單（%）：字串（逗號／頓號／分號／空白分隔）或陣列 */
@@ -1361,12 +1413,41 @@
     return Number(divFloor(num * 10000n, den)) / 100;
   }
 
+  const centsToUsd = (c) => Number(c) / 100;
+  /** 美股手續費（單位：美分 BigInt）：四捨五入至 $0.01，再與最低手續費比較 */
+  function usCommissionB(grossCents, feeR8, minFeeCents) {
+    if (grossCents <= 0n) return ZERO_COMM;
+    const raw = feeR8 > 0n ? divRoundHalfUp(grossCents * feeR8, R8) : 0n;
+    const fee = bmax(raw, minFeeCents);
+    return { charged: fee, refund: 0n, net: fee };
+  }
+  /** 美股 SEC Fee（單位：美分 BigInt）：僅賣出收取，無條件進位至 $0.01（不足 $0.01 以 $0.01 計） */
+  function usSecFeeB(grossCents, secR10) {
+    if (grossCents <= 0n || secR10 <= 0n) return 0n;
+    return divCeil(grossCents * secR10, R10);
+  }
+  /** 美股 FINRA TAF 費（單位：美分 BigInt）：僅賣出收取，$0.000195/股、無條件進位至 $0.01、單筆上限 $9.79 */
+  function usTafFeeB(sharesB, tafEnabled) {
+    if (!tafEnabled || sharesB <= 0n) return 0n;
+    const raw = divCeil(sharesB * US_TAF_NUM, US_TAF_DEN);
+    return raw > US_TAF_CAP_CENTS ? US_TAF_CAP_CENTS : raw;
+  }
+  const usCommToNumbers = (c) => ({ charged: centsToUsd(c.charged), refund: 0, net: centsToUsd(c.net) });
+
   function exitGrossB(ctx, pc) {
+    if (ctx.isUs) return BigInt(pc) * ctx.sharesB; // 單位：美分
     return BigInt(pc) * ctx.lotsB * 10n; // = 價格(分) × 股數 / 100
   }
-  /** 只算損益（BigInt），供反推搜尋使用 */
+  /** 只算損益（BigInt；台股＝元、美股＝美分），供反推搜尋使用 */
   function profitAt(ctx, pc) {
     const eg = exitGrossB(ctx, pc);
+    if (ctx.isUs) {
+      const xc = usCommissionB(eg, ctx.usFeeR8, ctx.usMinFeeCents);
+      const xt = ctx.isLong ? usSecFeeB(eg, ctx.usSecR10) : 0n;
+      const xtaf = ctx.isLong ? ctx.sellTafCents : 0n;
+      const costs = ctx.entryCostsNet + xc.net + xt + xtaf;
+      return ctx.isLong ? eg - ctx.G - costs : ctx.G - eg - costs;
+    }
     const xc = commissionB(eg, ctx.discMicro, ctx.minFee, ctx.feeModel);
     const xt = ctx.exitHasTax ? taxB(eg, ctx.taxN, ctx.taxD, ctx.taxRounding) : 0n;
     const xs = ctx.exitHasShortFee ? divRoundHalfUp(eg * ctx.sfR8, R8) : 0n;
@@ -1376,6 +1457,35 @@
   /** 完整 Trade（number） */
   function tradeAt(ctx, pc, ticks) {
     const eg = exitGrossB(ctx, pc);
+    if (ctx.isUs) {
+      const xc = usCommissionB(eg, ctx.usFeeR8, ctx.usMinFeeCents);
+      const xt = ctx.isLong ? usSecFeeB(eg, ctx.usSecR10) : 0n;
+      const xtaf = ctx.isLong ? ctx.sellTafCents : 0n;
+      const totalCosts = ctx.entryCostsNet + xc.net + xt + xtaf;
+      const profit = ctx.isLong ? eg - ctx.G - totalCosts : ctx.G - eg - totalCosts;
+      const amount = ctx.isLong ? eg - xc.charged - xt - xtaf : -(eg + xc.charged);
+      const changeRate = (pc - ctx.entryPc) / ctx.entryPc;
+      return {
+        exitPrice: pc / 100,
+        ticks: ticks === undefined ? gridIndex(ctx.table, pc) - ctx.entryIdx : ticks,
+        changeRate,
+        exitGross: centsToUsd(eg),
+        exitCommission: usCommToNumbers(xc),
+        exitTax: centsToUsd(xt),
+        exitTaf: centsToUsd(xtaf),
+        exitShortFee: 0,
+        interest: 0,
+        interestType: null,
+        totalCosts: centsToUsd(totalCosts),
+        profit: centsToUsd(profit),
+        returnRate: ctx.capitalBase > 0n ? Number(profit) / Number(ctx.capitalBase) : null,
+        nominalReturnRate: ctx.isLong ? changeRate : 0 - changeRate,
+        settlement: { label: ctx.settlementLabel, amount: centsToUsd(amount) },
+        maintenance: null,
+        belowCall: false,
+        beyondLimit: false,
+      };
+    }
     const xc = commissionB(eg, ctx.discMicro, ctx.minFee, ctx.feeModel);
     const xt = ctx.exitHasTax ? taxB(eg, ctx.taxN, ctx.taxD, ctx.taxRounding) : 0n;
     const xs = ctx.exitHasShortFee ? divRoundHalfUp(eg * ctx.sfR8, R8) : 0n;
@@ -1435,6 +1545,16 @@
 
   /** 理論價（忽略最低手續費與取整），浮點，僅供顯示與搜尋起點 */
   function theoreticalPrice(ctx, desired) {
+    if (ctx.isUs) {
+      const rFee = ctx.usFeeRateNum;
+      const rSec = ctx.usSecRateNum;
+      const G = Number(ctx.G); // 美分
+      const K = Number(ctx.entryCostsNet + (ctx.isLong ? ctx.sellTafCents : 0n));
+      if (ctx.isLong) {
+        return (G + K + desired) / (ctx.shares * 100 * (1 - rFee - rSec));
+      }
+      return (G - K - desired) / (ctx.shares * 100 * (1 + rFee));
+    }
     const rFee = 0.001425 * ctx.discValue;
     const G = Number(ctx.G);
     const K = Number(ctx.entryCostsNet + ctx.interestCost - ctx.interestIncome);
@@ -1546,23 +1666,291 @@
   function solve(ctx, desired) {
     const core = solveCore(ctx, desired);
     const trade = tradeAt(ctx, core.pc);
-    trade.desiredProfit = Number(desired);
+    trade.desiredProfit = ctx.isUs ? centsToUsd(desired) : Number(desired);
     trade.theoreticalPrice = Number.isFinite(core.theo) && core.theo > 0 ? core.theo : null;
     trade.reachable = core.reachable;
     return { trade, pc: core.pc };
   }
 
   // ════════════════════════════════════════════════════════════════════
-  // 13. calculate()
+  // 13. calculate() — 台股與美股（複委託）
   // ════════════════════════════════════════════════════════════════════
   function fail(errors, bag) {
     return { ok: false, errors, warnings: bag.list };
   }
 
-  function calculateImpl(raw) {
+  const US_MODE = deepFreeze({
+    key: 'usCash', label: '美股複委託', shortLabel: '美股',
+    directions: ['long', 'short'], directionLabels: { long: '買進→賣出', short: '先賣後買' },
+    actions: { long: { entry: '買進', exit: '賣出' }, short: { entry: '賣出', exit: '買進回補' } },
+    credit: false, sameDay: false, hasInterest: false,
+    notes: RULES.us.notes,
+  });
+  const US_PRODUCT = deepFreeze({ key: 'usStock', label: '美股／ETF', unit: '股', tickTable: 'us' });
+
+  function calculateUsImpl(input) {
     const bag = makeBag();
     const errors = [];
+
+    // ── 方向 ──
+    let direction = str(input.usDirection || input.direction);
+    if (direction === '') direction = 'long';
+    if (direction !== 'long' && direction !== 'short') {
+      errors.push({ code: 'INVALID_DIRECTION', field: 'usDirection', message: `不支援的方向「${direction}」` });
+    }
+
+    // ── 進場價（USD） ──
+    const ep = readNum(input.entryPrice);
+    if (ep.blank) errors.push({ code: 'ENTRY_PRICE_REQUIRED', field: 'entryPrice', message: '請輸入進場價（USD）' });
+    else if (ep.invalid) errors.push({ code: 'ENTRY_PRICE_INVALID', field: 'entryPrice', message: '進場價格式不正確' });
+    else if (ep.dec.n <= 0n || decCmp(ep.dec, BigInt(US_PRICE_MAX_CENTS), 100n) > 0) {
+      errors.push({ code: 'ENTRY_PRICE_OUT_OF_RANGE', field: 'entryPrice', message: `進場價須大於 0 且不超過 $${groupDigits(String(US_PRICE_MAX_CENTS / 100))}` });
+    }
+
+    // ── 股數 ──
+    const sh = readNum(input.usShares);
+    let shares = 0;
+    if (sh.blank) errors.push({ code: 'SHARES_REQUIRED', field: 'usShares', message: '請輸入股數' });
+    else if (sh.invalid) errors.push({ code: 'SHARES_INVALID', field: 'usShares', message: '股數格式不正確' });
+    else {
+      let x = scaleDec(sh.dec, 0);
+      if (x < 1n) {
+        errors.push({ code: 'SHARES_OUT_OF_RANGE', field: 'usShares', message: '股數須為 1 以上的整數' });
+      } else {
+        if (!decIsInt(sh.dec)) bag.add('NON_INTEGER_SHARES', 'warn', `股數 ${decToString(sh.dec)} 不是整數，已四捨五入為 ${x} 股`, 'usShares');
+        if (x > BigInt(US_SHARES_MAX)) {
+          bag.add('SHARES_CLAMPED', 'warn', `股數超過上限，已以 ${groupDigits(String(US_SHARES_MAX))} 股計算`, 'usShares');
+          x = BigInt(US_SHARES_MAX);
+        }
+        shares = Number(x);
+      }
+    }
+    if (errors.length) return fail(errors, bag);
+
+    const isLong = direction === 'long';
+    const table = TICK_TABLES.us;
+
+    // ── 進場價對齊 $0.01 ──
+    const entryPc = nearestGridR(table, ep.dec.n * 100n, ep.dec.d);
+    const rawEntryPrice = decToNumber(ep.dec);
+    const entryPriceAdjusted = BigInt(entryPc) * ep.dec.d !== ep.dec.n * 100n;
+    if (entryPriceAdjusted) {
+      bag.add('ENTRY_ADJUSTED', 'warn', `進場價 $${decToString(ep.dec)} 非 0.01 美元倍數，已調整為 $${fmtPc(entryPc)}`, 'entryPrice');
+    }
+
+    // ── 美股手續費、低消、SEC Fee、TAF、參考匯率 ──
+    const usFeeR8 = cleanPercent(input.usFeeRate, {
+      field: 'usFeeRate', label: '美股手續費率', def: '0.08', scale: 8, min: 0n, max: 10000000n,
+      minMsg: () => '美股手續費率不可為負數，已以 0% 計算', maxMsg: () => '美股手續費率超過 10%，已以 10% 計算',
+    }, bag);
+    let usMinFeeCents = 0n;
+    {
+      const r = readNum(input.usMinFee);
+      if (r.invalid) bag.add('INPUT_INVALID', 'warn', '最低手續費格式不正確，已改用預設值 $0（免低收）', 'usMinFee');
+      else if (!r.blank) {
+        let x = scaleDec(r.dec, 2); // USD → 美分
+        if (x < 0n) { bag.add('INPUT_CLAMPED', 'warn', '最低手續費不可為負數，已以 $0 計算', 'usMinFee'); x = 0n; }
+        else if (x > 1000000n) { bag.add('INPUT_CLAMPED', 'warn', '最低手續費超過 $10,000，已以 $10,000 計算', 'usMinFee'); x = 1000000n; }
+        usMinFeeCents = x;
+      }
+    }
+    const usSecR10 = cleanPercent(input.usSecFeeRate, {
+      field: 'usSecFeeRate', label: 'SEC 交易徵費率', def: '0.00206', scale: 10, min: 0n, max: 100000000n,
+      minMsg: () => 'SEC 費率不可為負數，已以 0% 計算', maxMsg: () => 'SEC 費率超過 1%，已以 1% 計算',
+    }, bag);
+    const tafMode = cleanEnum(input.usTafEnabled, ['off', 'on'], 'off', 'usTafEnabled', 'FINRA TAF 費', bag);
+    const tafEnabled = tafMode === 'on';
+    let fxRate = null;
+    {
+      const r = readNum(input.usFxRate);
+      if (!r.blank) {
+        if (r.invalid || r.dec.n <= 0n || decCmp(r.dec, 1000n, 1n) > 0) {
+          bag.add('FX_RATE_INVALID', 'warn', '台幣匯率須大於 0 且不超過 1,000，已忽略台幣換算', 'usFxRate');
+        } else {
+          fxRate = decToNumber(r.dec);
+        }
+      }
+    }
+
+    if (!isLong) {
+      bag.add('US_SHORT_NOTE', 'info', '台灣複委託目前不支援美股放空，先賣後買僅供海外券商或模擬試算（借券費未計入）', 'usDirection');
+    }
+
+    // ── 建立美股計算脈絡（BigInt 單位：美分） ──
+    const sharesB = BigInt(shares);
+    const G = BigInt(entryPc) * sharesB; // 成交金額（美分）
+    const ec = usCommissionB(G, usFeeR8, usMinFeeCents);
+    const sellTafCents = usTafFeeB(sharesB, tafEnabled);
+    const etax = !isLong ? usSecFeeB(G, usSecR10) : 0n;
+    const etaf = !isLong ? sellTafCents : 0n;
+    const entryCostsNet = ec.net + etax + etaf;
+    let cashOut = 0n; let cashIn = 0n; let capitalBase; let capitalBaseLabel;
+    if (isLong) {
+      cashOut = G + ec.charged;
+      capitalBase = G + ec.net;
+      capitalBaseLabel = '買進總成本';
+    } else {
+      cashIn = G - ec.charged - etax - etaf;
+      capitalBase = G - ec.net - etax - etaf;
+      capitalBaseLabel = '賣出淨收入';
+    }
+
+    const usFeeRateNum = Number(decToString({ n: usFeeR8, d: R8 }));
+    const usSecRateNum = Number(decToString({ n: usSecR10, d: R10 }));
+    const ctx = {
+      isUs: true, table, modeKey: 'usCash', isLong, sharesB, shares,
+      entryPc, entryIdx: gridIndex(table, entryPc), G,
+      usFeeR8, usFeeRateNum, usMinFeeCents,
+      usSecR10, usSecRateNum, tafEnabled, sellTafCents,
+      ec, etax, etaf, entryCostsNet, capitalBase,
+      settlementLabel: isLong ? '賣出應收' : '回補應付',
+      limits: null, idxMax: gridIndex(table, SEARCH_MAX_CENTS),
+      marginCallPc: null, breakEvenPc: null,
+    };
+
+    // ── 兩平 ──
+    const be = solve(ctx, 0n);
+    const breakEven = be.trade;
+    if (breakEven.reachable) ctx.breakEvenPc = be.pc;
+    else bag.add('BREAKEVEN_UNREACHABLE', 'warn', isLong ? '在價格上限內無法達到兩平' : '即使回補價跌到 $0.01 仍無法達到兩平（費用高於可能獲利）', null);
+
+    // ── 停損（USD → 美分） ──
+    let stopLoss = null;
+    let stopLossClean = null;
+    {
+      const r = readNum(input.stopLoss);
+      if (r.invalid) bag.add('STOP_LOSS_INVALID', 'warn', '停損金額格式不正確，已忽略', 'stopLoss');
+      else if (!r.blank && r.dec.n !== 0n) {
+        const absDec = { n: r.dec.n < 0n ? -r.dec.n : r.dec.n, d: r.dec.d };
+        const amtCents = scaleDec(absDec, 2);
+        if (amtCents < 1n || amtCents > 100000000000000n) bag.add('STOP_LOSS_INVALID', 'warn', '停損金額須介於 $0.01 與 $1,000,000,000,000 之間，已忽略', 'stopLoss');
+        else {
+          stopLossClean = centsToUsd(amtCents);
+          const sl = solve(ctx, -amtCents);
+          stopLoss = sl.trade;
+          stopLoss.stopLossAmount = centsToUsd(amtCents);
+          if (!stopLoss.reachable) bag.add('STOP_LOSS_UNREACHABLE', 'info', '停損金額大於此部位在價格範圍內的最大可能虧損，無對應停損價', 'stopLoss');
+        }
+      }
+    }
+
+    // ── 自訂出場（USD） ──
+    let manualExit = null;
+    let exitClean = null;
+    let rawExitPrice = null;
+    let exitPriceAdjusted = false;
+    {
+      const r = readNum(input.exitPrice);
+      if (!r.blank) {
+        if (r.invalid || r.dec.n <= 0n || decCmp(r.dec, BigInt(US_PRICE_MAX_CENTS), 100n) > 0) {
+          bag.add('EXIT_INVALID', 'warn', `出場價須大於 0 且不超過 $${groupDigits(String(US_PRICE_MAX_CENTS / 100))}，已忽略`, 'exitPrice');
+        } else {
+          const pc = nearestGridR(table, r.dec.n * 100n, r.dec.d);
+          rawExitPrice = decToNumber(r.dec);
+          exitPriceAdjusted = BigInt(pc) * r.dec.d !== r.dec.n * 100n;
+          if (exitPriceAdjusted) bag.add('EXIT_ADJUSTED', 'warn', `出場價 $${decToString(r.dec)} 非 0.01 美元倍數，已調整為 $${fmtPc(pc)}`, 'exitPrice');
+          exitClean = pc / 100;
+          manualExit = tradeAt(ctx, pc);
+        }
+      }
+    }
+
+    // ── 目標價 ──
+    const tp = parseTargetsInternal(input.targets);
+    if (tp.invalid.length) bag.add('TARGETS_INVALID', 'warn', `目標淨利率中無法辨識的項目已忽略：${tp.invalid.slice(0, 5).join('、')}`, 'targets');
+    if (tp.truncated) bag.add('TARGETS_TRUNCATED', 'info', `目標淨利率最多 ${MAX_TARGETS} 項，已只取前 ${MAX_TARGETS} 項`, 'targets');
+    let targets = [];
+    if (capitalBase <= 0n) {
+      bag.add('CAPITAL_BASE_NONPOSITIVE', 'warn', `報酬率分母（${capitalBaseLabel}）不大於 0，無法計算報酬率與目標價`, 'targets');
+    } else {
+      targets = tp.decs.map((dec) => {
+        const desired = divRoundHalfUp(capitalBase * dec.n, dec.d * 100n); // 美分
+        const t = solve(ctx, desired).trade;
+        t.targetPct = decToNumber(dec);
+        t.targetRate = decToNumber({ n: dec.n, d: dec.d * 100n });
+        return t;
+      });
+    }
+
+    const secPctLabel = ratePctLabel(usSecR10, R10);
+    const feePctLabel = ratePctLabel(usFeeR8, R8);
+    const result = {
+      ok: true,
+      market: 'us',
+      currency: 'USD',
+      inputs: {
+        market: 'us',
+        usDirection: direction,
+        usShares: shares,
+        entryPrice: entryPc / 100,
+        exitPrice: exitClean,
+        stopLoss: stopLossClean,
+        usFeeRate: Number(scaledToPlain(usFeeR8, 6)),
+        usMinFee: centsToUsd(usMinFeeCents),
+        usSecFeeRate: Number(scaledToPlain(usSecR10, 8)),
+        usTafEnabled: tafMode,
+        usFxRate: fxRate,
+        targets: tp.decs.map(decToNumber),
+      },
+      mode: US_MODE, product: US_PRODUCT, tradeMode: 'usCash', direction, productType: 'usStock',
+      lots: null, shares,
+      entryPrice: entryPc / 100, rawEntryPrice, entryPriceAdjusted, entryTick: 0.01,
+      rawExitPrice, exitPriceAdjusted,
+      tradeDate: todayTaipei(),
+      tax: {
+        rate: usSecRateNum,
+        label: usSecR10 > 0n ? `SEC Fee ${secPctLabel}（僅賣出）` : 'SEC Fee 0%',
+        note: RULES.us.secFeeNote,
+        overridden: false, rounding: 'ceil', date: null, basis: 'sell',
+      },
+      taf: {
+        enabled: tafEnabled,
+        perShare: RULES.us.tafRatePerShare,
+        maxUsd: RULES.us.tafMaxUsd,
+        amount: centsToUsd(sellTafCents),
+        note: RULES.us.tafNote,
+      },
+      fee: {
+        discount: 1, discountLabel: feePctLabel, minFee: centsToUsd(usMinFeeCents), model: 'us',
+        modelLabel: usMinFeeCents === 0n ? '免低收' : `低消 ${fmtUsd(centsToUsd(usMinFeeCents))}`,
+        baseRate: usFeeRateNum,
+        effectiveRate: usFeeRateNum,
+      },
+      fxRate,
+      shortMarginMin: null,
+      credit: null,
+      limits: null,
+      entry: {
+        price: entryPc / 100,
+        gross: centsToUsd(G),
+        commission: usCommToNumbers(ec),
+        tax: centsToUsd(etax),
+        taf: centsToUsd(etaf),
+        shortFee: 0,
+        loan: null, selfFunds: null, collateral: null, guaranty: null,
+        cashOut: centsToUsd(cashOut),
+        cashIn: centsToUsd(cashIn),
+        capitalBase: centsToUsd(capitalBase),
+        capitalBaseLabel,
+        returnRateLabel: '報酬率',
+        interest: 0, interestType: null, days: null,
+        maintenance: null, marginCallPrice: null, marginCallDirection: null,
+      },
+      breakEven,
+      stopLoss,
+      manualExit,
+      targets,
+      warnings: bag.list,
+    };
+    CTX.set(result, ctx);
+    return result;
+  }
+
+  function calculateImpl(raw) {
     const input = raw && typeof raw === 'object' ? raw : {};
+    if (str(input.market) === 'us') return calculateUsImpl(input);
+    const bag = makeBag();
+    const errors = [];
 
     // ── 模式／方向／商品 ──
     const tradeMode = str(input.tradeMode);
@@ -1932,7 +2320,10 @@
 
     const result = {
       ok: true,
+      market: 'tw',
+      currency: 'TWD',
       inputs: {
+        market: 'tw',
         tradeMode, direction, productType, lots,
         entryPrice: entryPc / 100, exitPrice: exitClean, stopLoss: stopLossClean,
         refPrice: refClean, limitPct: limitPctClean,
@@ -2105,29 +2496,35 @@ const MODE_KEYS = ['dayTrade', 'cash', 'marginLong', 'marginShort', 'creditDayTr
 const PRODUCT_KEYS = ['stock', 'etf', 'bondEtf'];
 const TAB_KEYS = ['details', 'targets', 'ladder'];
 const ENUMS = {
+  market: ['tw', 'us'],
   tradeMode: MODE_KEYS,
   direction: ['long', 'short'],
   productType: PRODUCT_KEYS,
   feeModel: ['instant', 'monthly'],
   taxRounding: ['floor', 'round'],
   limitPct: ['0.1', '0.2', 'none'],
+  usDirection: ['long', 'short'],
+  usTafEnabled: ['off', 'on'],
 };
 // 分享連結 hash 的短鍵
 const HASH_KEYS = {
+  market: 'mk',
   tradeMode: 'm', direction: 'd', productType: 'p', lots: 'n', entryPrice: 'e', exitPrice: 'x', stopLoss: 'sl',
   refPrice: 'r', limitPct: 'lp', discount: 'dc', minFee: 'mf', feeModel: 'fm', taxRounding: 'tr', taxRateOverride: 'to',
   tradeDate: 'td', marginSelfRatio: 'ms', marginInterestRate: 'mi', marginDays: 'md', shortMarginRatio: 'ss',
   shortFeeRate: 'sf', shortInterestRate: 'si', shortDays: 'sd', targets: 'tg',
+  usDirection: 'ud', usShares: 'us', usFeeRate: 'uf', usMinFee: 'um', usSecFeeRate: 'usec', usTafEnabled: 'ut', usFxRate: 'fx',
 };
 // 交易日期一律帶上（空白＝今日會隨開啟日期改變，收件者看到的結果會與分享時不同）
-const HASH_ALWAYS = ['tradeMode', 'direction', 'productType', 'lots', 'entryPrice', 'tradeDate'];
+const HASH_ALWAYS_TW = ['tradeMode', 'direction', 'productType', 'lots', 'entryPrice', 'tradeDate'];
+const HASH_ALWAYS_US = ['market', 'usDirection', 'usShares', 'entryPrice'];
 const LADDER_DEFAULT = 10;
 const LADDER_STEP = 5;
 const ENTER_ORDER = ['f-entry', 'f-lots', 'f-exit', 'f-stop'];
 // 這些欄位的提醒已在「價格與數量」卡行內顯示，結果區不重複列出
-const INLINE_FIELDS = { entryPrice: 1, lots: 1, exitPrice: 1, stopLoss: 1, direction: 1, tradeMode: 1 };
+const INLINE_FIELDS = { entryPrice: 1, lots: 1, usShares: 1, exitPrice: 1, stopLoss: 1, direction: 1, usDirection: 1, tradeMode: 1 };
 const SECTION_FIELDS = {
-  fees: ['discount', 'minFee', 'feeModel'],
+  fees: ['discount', 'minFee', 'feeModel', 'usFeeRate', 'usMinFee', 'usSecFeeRate', 'usTafEnabled', 'usFxRate'],
   credit: ['marginSelfRatio', 'marginInterestRate', 'marginDays', 'shortMarginRatio', 'shortFeeRate', 'shortInterestRate', 'shortDays'],
   advanced: ['refPrice', 'limitPct', 'tradeDate', 'taxRounding', 'taxRateOverride', 'targets'],
 };
@@ -2135,17 +2532,22 @@ const SECTION_FIELDS = {
 // ── 顯示工具 ────────────────────────────────────────────────────────
 const MINUS = '−';
 const fixMinus = (s) => (typeof s === 'string' ? s.replace(/^-/, MINUS) : s);
-const money = (v) => fixMinus(F.currency(v));
-const smoney = (v) => fixMinus(F.signedCurrency(v));
+const money = (v, isUs) => fixMinus(isUs ? F.usd(v) : F.currency(v));
+const smoney = (v, isUs) => fixMinus(isUs ? F.signedUsd(v) : F.signedCurrency(v));
 const pct = (v, signed) => (v == null || !isFinite(v) ? '--' : fixMinus(F.percent(v, signed ? { signed: true } : undefined)));
 const ratio = (v) => (v == null || !isFinite(v) ? '--' : F.ratio(v));
-const priceText = (v) => (v == null ? '--' : F.price(v));
+const priceText = (v, isUs) => (v == null ? '--' : (isUs ? '$' : '') + F.price(v));
 const ticksText = (n) => (n == null ? '--' : fixMinus(F.ticks(n)));
 const signCls = (v) => (v > 0 ? 'c-gain' : v < 0 ? 'c-loss' : 'c-flat');
 const fmtInputPrice = (p) => String(Math.round(p * 100) / 100);
 const isBlank = (s) => s == null || String(s).trim() === '';
 const intText = (n) => Number(n).toLocaleString('zh-TW');
 const pctInput = (v) => (v == null || !isFinite(v) ? '' : String(Math.round(v * 1e6) / 1e6));
+const twdApprox = (usd, fx, signed) => {
+  if (fx == null || usd == null || !isFinite(usd)) return null;
+  const v = usd * fx;
+  return '≈ NT$ ' + fixMinus(signed ? F.signedCurrency(v) : F.currency(v));
+};
 
 // ── 儲存（localStorage 讀寫一律 try/catch） ─────────────────────────────
 function readStore() {
@@ -2221,9 +2623,10 @@ function parseHash(hash) {
 function buildHash(inputs) {
   const p = new URLSearchParams();
   p.set('v', '2');
+  const always = inputs.market === 'us' ? HASH_ALWAYS_US : HASH_ALWAYS_TW;
   Object.keys(HASH_KEYS).forEach((k) => {
     const v = inputs[k] == null ? '' : String(inputs[k]);
-    if (HASH_ALWAYS.indexOf(k) >= 0 || v !== DEFAULTS[k]) p.set(HASH_KEYS[k], v);
+    if (always.indexOf(k) >= 0 || v !== DEFAULTS[k]) p.set(HASH_KEYS[k], v);
   });
   return '#' + p.toString();
 }
@@ -2344,14 +2747,14 @@ function HapticSwitch() {
 }
 
 // ── 基本元件 ─────────────────────────────────────────────────────────
-function PriceTag({ value, base, className }) {
+function PriceTag({ value, base, className, isUs }) {
   if (value == null) return <span className={className}>--</span>;
   const d = base == null ? 0 : value > base ? 1 : value < base ? -1 : 0;
   return (
     <span className={(className ? className + ' ' : '') + (d > 0 ? 'c-gain' : d < 0 ? 'c-loss' : 'c-flat')}>
       {d !== 0 && <span className="arrow" aria-hidden="true">{d > 0 ? '▲' : '▼'}</span>}
       {d !== 0 && <span className="sr-only">{d > 0 ? '（高於進場價）' : '（低於進場價）'}</span>}
-      {priceText(value)}
+      {priceText(value, isUs)}
     </span>
   );
 }
@@ -2556,7 +2959,8 @@ function StepField({ id, label, aside, value, onChange, onStep, canDown, canUp, 
 
 // 欄位 → 輸入框 id（「套用」等動作完成後的焦點目標）
 const FIELD_INPUT_IDS = {
-  entryPrice: 'f-entry', lots: 'f-lots', exitPrice: 'f-exit', stopLoss: 'f-stop', discount: 'f-discount', minFee: 'f-minfee',
+  entryPrice: 'f-entry', lots: 'f-lots', usShares: 'f-lots', exitPrice: 'f-exit', stopLoss: 'f-stop', discount: 'f-discount', minFee: 'f-minfee',
+  usFeeRate: 'f-usfee', usMinFee: 'f-usmin', usSecFeeRate: 'f-ussec', usFxRate: 'f-usfx',
   marginSelfRatio: 'f-mself', marginInterestRate: 'f-mrate', marginDays: 'f-mdays', shortMarginRatio: 'f-sratio',
   shortFeeRate: 'f-sfee', shortInterestRate: 'f-srate', shortDays: 'f-sdays', refPrice: 'f-ref', tradeDate: 'f-date',
   taxRateOverride: 'f-taxov', targets: 'f-targets',
@@ -2583,7 +2987,7 @@ function focusNext(currentId) {
 }
 
 // ── 欄位訊息（引擎 errors/warnings 依 field 分配；附「套用」動作） ───────────
-const INVALID_CODES = { INPUT_INVALID: 1, EXIT_INVALID: 1, REF_PRICE_INVALID: 1, STOP_LOSS_INVALID: 1, TAX_OVERRIDE_INVALID: 1, TRADE_DATE_INVALID: 1, TARGETS_INVALID: 1 };
+const INVALID_CODES = { INPUT_INVALID: 1, EXIT_INVALID: 1, REF_PRICE_INVALID: 1, STOP_LOSS_INVALID: 1, TAX_OVERRIDE_INVALID: 1, TRADE_DATE_INVALID: 1, TARGETS_INVALID: 1, FX_RATE_INVALID: 1 };
 function buildFieldMsgs(result, setField) {
   const map = {};
   const actionSeen = {};
@@ -2593,6 +2997,7 @@ function buildFieldMsgs(result, setField) {
       if (e.field && e.code !== 'ENTRY_PRICE_REQUIRED') add(e.field, { kind: 'error', code: e.code, text: e.message, invalid: true });
     });
   }
+  const isUs = result.ok && result.market === 'us';
   (result.warnings || []).forEach((w) => {
     if (!w.field) return;
     const m = { kind: w.level === 'warn' ? 'warn' : 'info', code: w.code, text: w.message, invalid: !!INVALID_CODES[w.code] };
@@ -2603,15 +3008,16 @@ function buildFieldMsgs(result, setField) {
       m.action = { label, run: (e) => { setField(k, v); keepFocus(e, FIELD_INPUT_IDS[k]); } };
     };
     if (result.ok) {
-      if (w.code === 'ENTRY_ADJUSTED') set('entryPrice', fmtInputPrice(result.entryPrice), '套用 ' + priceText(result.entryPrice));
-      else if (w.code === 'EXIT_ADJUSTED' && result.manualExit) set('exitPrice', fmtInputPrice(result.manualExit.exitPrice), '套用 ' + priceText(result.manualExit.exitPrice));
+      if (w.code === 'ENTRY_ADJUSTED') set('entryPrice', fmtInputPrice(result.entryPrice), '套用 ' + priceText(result.entryPrice, isUs));
+      else if (w.code === 'EXIT_ADJUSTED' && result.manualExit) set('exitPrice', fmtInputPrice(result.manualExit.exitPrice), '套用 ' + priceText(result.manualExit.exitPrice, isUs));
       else if (w.code === 'REF_ADJUSTED' && result.inputs.refPrice != null) set('refPrice', fmtInputPrice(result.inputs.refPrice), '套用');
       else if (w.code === 'SELF_RATIO_CLAMPED') set('marginSelfRatio', pctInput(result.inputs.marginSelfRatio), '改為 ' + pctInput(result.inputs.marginSelfRatio) + '%');
       else if (w.code === 'SHORT_MARGIN_RAISED' || w.code === 'SHORT_MARGIN_BELOW_MIN') set('shortMarginRatio', '', '改用自動');
       else if (w.code === 'NON_INTEGER_LOTS' || w.code === 'LOTS_CLAMPED') set('lots', String(result.lots), '改為 ' + intText(result.lots) + ' 張');
+      else if (w.code === 'NON_INTEGER_SHARES' || w.code === 'SHARES_CLAMPED') set('usShares', String(result.shares), '改為 ' + intText(result.shares) + ' 股');
       else if (w.code === 'DAYS_ROUNDED' && result.inputs[w.field] != null) set(w.field, String(result.inputs[w.field]), '改為 ' + result.inputs[w.field] + ' 天');
-    } else if (w.code === 'NON_INTEGER_LOTS' || w.code === 'LOTS_CLAMPED') {
-      // 失敗時沒有清洗後的張數，不提供套用
+    } else if (w.code === 'NON_INTEGER_LOTS' || w.code === 'LOTS_CLAMPED' || w.code === 'NON_INTEGER_SHARES' || w.code === 'SHARES_CLAMPED') {
+      // 失敗時沒有清洗後的張數／股數，不提供套用
     }
     add(w.field, m);
   });
@@ -2621,6 +3027,25 @@ const countWarn = (msgs, fields) => fields.reduce((n, f) => n + (msgs[f] || []).
 
 // ── 分享文字 ─────────────────────────────────────────────────────────
 function buildShareText(r, inputs) {
+  if (inputs.market === 'us' || (r.ok && r.market === 'us')) {
+    const lines = ['美股複委託交易計算機'];
+    if (!r.ok) {
+      lines.push('美股複委託（尚未完成試算）');
+      return lines.join('\n');
+    }
+    const dirLabel = r.mode.directionLabels[r.direction];
+    lines.push('美股複委託・' + dirLabel + '｜' + intText(r.shares) + ' 股 @ ' + priceText(r.entryPrice, true));
+    const be = r.breakEven;
+    lines.push(be.reachable ? '兩平價 ' + priceText(be.exitPrice, true) + '（' + ticksText(be.ticks) + '，' + pct(be.changeRate, true) + '）' : '兩平價：無法達成');
+    if (r.manualExit) {
+      const fxNote = r.fxRate ? '（' + twdApprox(r.manualExit.profit, r.fxRate, true) + '）' : '';
+      lines.push('出場 ' + priceText(r.manualExit.exitPrice, true) + '：淨損益 ' + smoney(r.manualExit.profit, true) + fxNote + '，報酬率 ' + pct(r.manualExit.returnRate, true));
+    }
+    if (r.stopLoss && r.stopLoss.reachable) lines.push('停損價 ' + priceText(r.stopLoss.exitPrice, true) + '（損益 ' + smoney(r.stopLoss.profit, true) + '）');
+    lines.push('手續費 ' + r.fee.discountLabel + '・' + r.fee.modelLabel + '；' + r.tax.label + (r.taf && r.taf.enabled ? '；含 TAF' : ''));
+    lines.push('僅供試算參考，實際以券商成交回報為準');
+    return lines.join('\n');
+  }
   const lines = ['台股當沖・融資融券計算機'];
   const mode = T.MODES[inputs.tradeMode] || T.MODES.marginLong;
   const prod = T.PRODUCTS[inputs.productType] || T.PRODUCTS.stock;
@@ -2671,7 +3096,7 @@ function Header({ scrolled, onShare, onReset, onAbout }) {
   return (
     <header className={'app-header' + (scrolled ? ' is-scrolled' : '')}>
       <div className="bar gutter mx-auto max-w-[1280px]">
-        <div className="bar-title" aria-hidden="true">台股當沖・融資融券計算機</div>
+        <div className="bar-title" aria-hidden="true">台美股交易計算機</div>
         <div className="relative flex items-center gap-2 ml-auto" ref={wrapRef}>
           <button type="button" className="icon-btn press" onClick={onShare} aria-label="分享試算結果">
             <Icon name="share" />
@@ -2698,6 +3123,7 @@ function Header({ scrolled, onShare, onReset, onAbout }) {
 
 // ── 交易設定卡 ─────────────────────────────────────────────────────────
 function TradeCard({ inputs, direction, setField, msgs, taxInfo }) {
+  const isUs = inputs.market === 'us';
   const mode = T.MODES[inputs.tradeMode];
   const product = T.PRODUCTS[inputs.productType];
   const act = mode.actions[direction];
@@ -2705,40 +3131,63 @@ function TradeCard({ inputs, direction, setField, msgs, taxInfo }) {
   return (
     <section className="card card-pad" aria-labelledby="sec-trade">
       <h2 id="sec-trade" className="headline mb-3" tabIndex={-1}>交易設定</h2>
-      <p id="lbl-mode" className="eyebrow mb-2">交易類型</p>
-      <Segmented idBase="mode" labelledBy="lbl-mode" value={inputs.tradeMode}
-        options={MODE_KEYS.map((k) => ({ value: k, label: T.MODES[k].shortLabel }))}
-        onChange={(v) => setField('tradeMode', v)} />
-      <p className="field-hint">{caption}</p>
-      <Messages id="msg-tradeMode" items={msgs.tradeMode} />
-      {mode.directions.length > 1 ? (
+      <p id="lbl-market" className="eyebrow mb-2">市場</p>
+      <Segmented idBase="market" labelledBy="lbl-market" value={inputs.market || 'tw'}
+        options={[{ value: 'tw', label: '台股 (TWD)' }, { value: 'us', label: '美股 (USD)' }]}
+        onChange={(v) => setField('market', v)} />
+      {isUs ? (
         <div className="mt-4">
-          <p id="lbl-dir" className="eyebrow mb-2">方向</p>
-          <Segmented idBase="dir" labelledBy="lbl-dir" value={direction}
-            options={mode.directions.map((d) => ({ value: d, label: mode.directionLabels[d] }))}
-            onChange={(v) => setField('direction', v)} />
-          <Messages id="msg-direction" items={msgs.direction} />
+          <p id="lbl-usdir" className="eyebrow mb-2">交易方向</p>
+          <Segmented idBase="usdir" labelledBy="lbl-usdir" value={inputs.usDirection === 'short' ? 'short' : 'long'}
+            options={[{ value: 'long', label: '買進→賣出' }, { value: 'short', label: '先賣後買' }]}
+            onChange={(v) => setField('usDirection', v)} />
+          <p className="field-hint">
+            預設依玉山證券美股複委託（手續費 0.08%、免低收、賣出 SEC Fee 0.00206%），可於下方「費用設定」調整。
+          </p>
+          <Messages id="msg-usDirection" items={msgs.usDirection} />
         </div>
-      ) : null}
-      <div className="mt-4">
-        <p id="lbl-prod" className="eyebrow mb-2">商品</p>
-        <Segmented idBase="prod" labelledBy="lbl-prod" value={inputs.productType}
-          options={PRODUCT_KEYS.map((k) => ({ value: k, label: T.PRODUCTS[k].label }))}
-          onChange={(v) => setField('productType', v)} />
-        <p className="field-hint">證交稅 {taxInfo.label}。{product.note}</p>
-        <p className="field-hint" id="prod-reits-hint">{RULES.tax.overrideNote}。</p>
-      </div>
+      ) : (
+        <React.Fragment>
+          <div className="mt-4">
+            <p id="lbl-mode" className="eyebrow mb-2">交易類型</p>
+            <Segmented idBase="mode" labelledBy="lbl-mode" value={inputs.tradeMode}
+              options={MODE_KEYS.map((k) => ({ value: k, label: T.MODES[k].shortLabel }))}
+              onChange={(v) => setField('tradeMode', v)} />
+            <p className="field-hint">{caption}</p>
+            <Messages id="msg-tradeMode" items={msgs.tradeMode} />
+          </div>
+          {mode.directions.length > 1 ? (
+            <div className="mt-4">
+              <p id="lbl-dir" className="eyebrow mb-2">方向</p>
+              <Segmented idBase="dir" labelledBy="lbl-dir" value={direction}
+                options={mode.directions.map((d) => ({ value: d, label: mode.directionLabels[d] }))}
+                onChange={(v) => setField('direction', v)} />
+              <Messages id="msg-direction" items={msgs.direction} />
+            </div>
+          ) : null}
+          <div className="mt-4">
+            <p id="lbl-prod" className="eyebrow mb-2">商品</p>
+            <Segmented idBase="prod" labelledBy="lbl-prod" value={inputs.productType}
+              options={PRODUCT_KEYS.map((k) => ({ value: k, label: T.PRODUCTS[k].label }))}
+              onChange={(v) => setField('productType', v)} />
+            <p className="field-hint">證交稅 {taxInfo.label}。{product.note}</p>
+            <p className="field-hint" id="prod-reits-hint">{RULES.tax.overrideNote}。</p>
+          </div>
+        </React.Fragment>
+      )}
     </section>
   );
 }
 
 // ── 價格與數量卡 ───────────────────────────────────────────────────────
-function PriceCard({ inputs, setField, result, msgs, onStepPrice, onStepLots }) {
-  const pt = inputs.productType;
-  const unit = T.PRODUCTS[pt].unit;
+function PriceCard({ inputs, setField, result, msgs, onStepPrice, onStepLots, onStepShares }) {
+  const isUs = inputs.market === 'us';
+  const pt = isUs ? 'us' : inputs.productType;
+  const unit = isUs ? '股' : T.PRODUCTS[inputs.productType].unit;
   const entryNum = T.parseNumber(inputs.entryPrice);
   const exitNum = T.parseNumber(inputs.exitPrice);
-  const lotsNum = T.parseNumber(inputs.lots);
+  const qtyVal = isUs ? inputs.usShares : inputs.lots;
+  const qtyNum = T.parseNumber(qtyVal);
   const entryOk = entryNum != null && entryNum > 0;
   const tick = result.ok ? result.entryTick : entryOk ? T.getTickSize(entryNum, pt) : null;
   const exitTick = exitNum != null && exitNum > 0 ? T.getTickSize(exitNum, pt) : null;
@@ -2749,8 +3198,9 @@ function PriceCard({ inputs, setField, result, msgs, onStepPrice, onStepLots }) 
   return (
     <section className="card card-pad" aria-labelledby="sec-price">
       <h2 id="sec-price" className="headline mb-3">價格與數量</h2>
-      <StepField id="f-entry" label="進場價" big value={inputs.entryPrice} placeholder="例如 100"
-        aside={tick ? '升降單位 ' + tick + ' 元' : '依價位自動對齊檔位'}
+      <StepField id="f-entry" label={isUs ? '進場價（USD）' : '進場價'} big value={inputs.entryPrice}
+        placeholder={isUs ? '例如 150' : '例如 100'}
+        aside={isUs ? '升降單位 $0.01' : (tick ? '升降單位 ' + tick + ' 元' : '依價位自動對齊檔位')}
         onChange={(v) => setField('entryPrice', v)} onStep={(d) => onStepPrice('entryPrice', d)}
         canDown={entryOk && entryNum > 0.01} canUp={entryOk} downLabel="進場價減 1 檔" upLabel="進場價加 1 檔"
         msgs={msgs.entryPrice} onEnter={() => focusNext('f-entry')}
@@ -2758,45 +3208,54 @@ function PriceCard({ inputs, setField, result, msgs, onStepPrice, onStepLots }) 
           <p className="inline-result" id="entry-result">
             <Parts parts={[
               r.breakEven.reachable
-                ? <React.Fragment>兩平價 <b><PriceTag value={r.breakEven.exitPrice} base={r.entryPrice} /></b>（{ticksText(r.breakEven.ticks)}）</React.Fragment>
+                ? <React.Fragment>兩平價 <b><PriceTag value={r.breakEven.exitPrice} base={r.entryPrice} isUs={isUs} /></b>（{ticksText(r.breakEven.ticks)}）</React.Fragment>
                 : <React.Fragment>兩平價 <b className="c-warn">無法達成</b></React.Fragment>,
-              r.breakEven.reachable && r.breakEven.beyondLimit ? <BeyondFlag price={r.breakEven.exitPrice} limits={r.limits} /> : null,
-              r.entry.marginCallPrice != null
+              !isUs && r.breakEven.reachable && r.breakEven.beyondLimit ? <BeyondFlag price={r.breakEven.exitPrice} limits={r.limits} /> : null,
+              !isUs && r.entry.marginCallPrice != null
                 ? <React.Fragment>追繳價 <b><PriceTag value={r.entry.marginCallPrice} base={r.entryPrice} /></b></React.Fragment> : null,
             ]} />
           </p>
         ) : null} />
-      <StepField id="f-lots" label="張數" value={inputs.lots} inputMode="numeric" placeholder="1"
-        aside={lotsNum != null && lotsNum >= 1 ? '共 ' + intText(Math.round(lotsNum) * 1000) + ' ' + unit : '1 張 = 1,000 ' + unit}
-        onChange={(v) => setField('lots', v)} onStep={onStepLots}
-        canDown={lotsNum != null && lotsNum > 1} canUp={lotsNum == null || lotsNum < 100000}
-        downLabel="減少 1 張" upLabel="增加 1 張" msgs={msgs.lots} onEnter={() => focusNext('f-lots')} />
-      <StepField id="f-exit" label="出場價（選填）" value={inputs.exitPrice} placeholder="試算自訂出場"
+      {isUs ? (
+        <StepField id="f-lots" label="股數" value={inputs.usShares} inputMode="numeric" placeholder="10"
+          aside={qtyNum != null && qtyNum >= 1 ? '共 ' + intText(Math.round(qtyNum)) + ' 股' : '整股（1 股起）'}
+          onChange={(v) => setField('usShares', v)} onStep={onStepShares}
+          canDown={qtyNum != null && qtyNum > 1} canUp={qtyNum == null || qtyNum < RULES.us.sharesMax}
+          downLabel="減少 1 股" upLabel="增加 1 股" msgs={msgs.usShares} onEnter={() => focusNext('f-lots')} />
+      ) : (
+        <StepField id="f-lots" label="張數" value={inputs.lots} inputMode="numeric" placeholder="1"
+          aside={qtyNum != null && qtyNum >= 1 ? '共 ' + intText(Math.round(qtyNum) * 1000) + ' ' + unit : '1 張 = 1,000 ' + unit}
+          onChange={(v) => setField('lots', v)} onStep={onStepLots}
+          canDown={qtyNum != null && qtyNum > 1} canUp={qtyNum == null || qtyNum < 100000}
+          downLabel="減少 1 張" upLabel="增加 1 張" msgs={msgs.lots} onEnter={() => focusNext('f-lots')} />
+      )}
+      <StepField id="f-exit" label={isUs ? '出場價（選填，USD）' : '出場價（選填）'} value={inputs.exitPrice} placeholder="試算自訂出場"
         aside={!isBlank(inputs.exitPrice) ? (
           <button type="button" className="btn btn-plain btn-sm press -my-2.5 -mr-2" onClick={(e) => { setField('exitPrice', ''); keepFocus(e, 'f-exit'); }}>清除</button>
-        ) : (exitTick ? '升降單位 ' + exitTick + ' 元' : '空白時 ± 以進場價起算')}
+        ) : (isUs ? '空白時 ± 以進場價起算' : (exitTick ? '升降單位 ' + exitTick + ' 元' : '空白時 ± 以進場價起算'))}
         onChange={(v) => setField('exitPrice', v)} onStep={(d) => onStepPrice('exitPrice', d)}
         canDown={exitBase} canUp={exitBase} downLabel="出場價減 1 檔" upLabel="出場價加 1 檔"
         msgs={msgs.exitPrice} onEnter={() => focusNext('f-exit')}
         after={mx ? (
           <p className="inline-result" id="exit-result">
             <Parts parts={[
-              <React.Fragment>淨損益 <b className={signCls(mx.profit)}>{smoney(mx.profit)}</b></React.Fragment>,
+              <React.Fragment>淨損益 <b className={signCls(mx.profit)}>{smoney(mx.profit, isUs)}</b>{isUs && r.fxRate ? '（' + twdApprox(mx.profit, r.fxRate, true) + '）' : ''}</React.Fragment>,
               <React.Fragment>{r.entry.returnRateLabel} <b className={signCls(mx.profit)}>{pct(mx.returnRate, true)}</b></React.Fragment>,
-              mx.maintenance != null
+              !isUs && mx.maintenance != null
                 ? <React.Fragment>維持率 <b className={mx.belowCall ? 'c-danger' : ''}>{F.maintenance(mx.maintenance)}</b></React.Fragment> : null,
             ]} />
           </p>
         ) : null} />
-      <TextField id="f-stop" label="停損金額（選填）" value={inputs.stopLoss} inputMode="numeric" suffix="元"
-        placeholder="例如 5000" onChange={(v) => setField('stopLoss', v)} msgs={msgs.stopLoss}
+      <TextField id="f-stop" label={isUs ? '停損金額（選填，USD）' : '停損金額（選填）'} value={inputs.stopLoss}
+        inputMode={isUs ? 'decimal' : 'numeric'} suffix={isUs ? 'USD' : '元'}
+        placeholder={isUs ? '例如 50' : '例如 5000'} onChange={(v) => setField('stopLoss', v)} msgs={msgs.stopLoss}
         aside="可承受的最大淨虧損"
         after={sl && sl.reachable ? (
           <p className="inline-result" id="stop-result">
             <Parts parts={[
-              <React.Fragment>停損價 <b><PriceTag value={sl.exitPrice} base={r.entryPrice} /></b>（{ticksText(sl.ticks)}）</React.Fragment>,
-              sl.beyondLimit ? <BeyondFlag price={sl.exitPrice} limits={r.limits} /> : null,
-              <React.Fragment>損益 <b className={signCls(sl.profit)}>{smoney(sl.profit)}</b></React.Fragment>,
+              <React.Fragment>停損價 <b><PriceTag value={sl.exitPrice} base={r.entryPrice} isUs={isUs} /></b>（{ticksText(sl.ticks)}）</React.Fragment>,
+              !isUs && sl.beyondLimit ? <BeyondFlag price={sl.exitPrice} limits={r.limits} /> : null,
+              <React.Fragment>損益 <b className={signCls(sl.profit)}>{smoney(sl.profit, isUs)}</b></React.Fragment>,
             ]} />
           </p>
         ) : null} />
@@ -2806,11 +3265,60 @@ function PriceCard({ inputs, setField, result, msgs, onStepPrice, onStepLots }) 
 
 // ── 費用設定 ─────────────────────────────────────────────────────────
 function FeeSection({ inputs, setField, result, msgs, open, onToggle }) {
+  const isUs = inputs.market === 'us';
+  const n = countWarn(msgs, SECTION_FIELDS.fees);
+  if (isUs) {
+    const feeVal = T.parseNumber(inputs.usFeeRate);
+    const minVal = T.parseNumber(inputs.usMinFee);
+    const secVal = T.parseNumber(inputs.usSecFeeRate);
+    const feeLabel = isBlank(inputs.usFeeRate) ? RULES.us.defaultFeeRate + '%' : inputs.usFeeRate + '%';
+    const minLabel = minVal != null && minVal > 0 ? '低消 $' + minVal : '免低收';
+    const secLabel = isBlank(inputs.usSecFeeRate) ? 'SEC ' + RULES.us.defaultSecFeeRate + '%' : 'SEC ' + inputs.usSecFeeRate + '%';
+    const summary = [feeLabel, minLabel, secLabel].concat(inputs.usTafEnabled === 'on' ? ['含 TAF'] : []).join('・');
+    return (
+      <Disclosure id="fees" title="美股費用設定" open={open} onToggle={onToggle} summary={summary}
+        badge={n ? <span className="badge badge-warn"><Icon name="warn" size={12} />{n}</span> : null}>
+        <TextField id="f-usfee" label="券商手續費率" value={inputs.usFeeRate} suffix="%" placeholder="0.08"
+          aside="預設：玉山複委託 0.08%" onChange={(v) => setField('usFeeRate', v)} msgs={msgs.usFeeRate}
+          hint={RULES.us.feeRounding + '。玉山證券人工／電子下單牌告皆為 0.08%。'}>
+          <Chips label="美股手續費率快選"
+            options={RULES.us.feeRatePresets.map((p) => ({ value: p, label: p === 0.08 ? '0.08% 玉山' : p + '%' }))}
+            isSelected={(v) => feeVal != null && Math.abs(feeVal - v) < 1e-9} onPick={(v) => setField('usFeeRate', String(v))} />
+        </TextField>
+        <TextField id="f-usmin" label="最低手續費" value={inputs.usMinFee} suffix="USD" placeholder="0"
+          aside="玉山免低收" onChange={(v) => setField('usMinFee', v)} msgs={msgs.usMinFee}
+          hint="每筆成交的手續費下限（USD）；0 代表免低收。">
+          <Chips label="最低手續費快選"
+            options={RULES.us.minFeePresets.map((p) => ({ value: p, label: p === 0 ? '免低收 ($0)' : '$' + p }))}
+            isSelected={(v) => minVal != null && Math.abs(minVal - v) < 1e-9} onPick={(v) => setField('usMinFee', String(v))} />
+        </TextField>
+        <TextField id="f-ussec" label="交易徵費（SEC Fee）" value={inputs.usSecFeeRate} suffix="%" placeholder="0.00206"
+          aside="僅賣出收取" onChange={(v) => setField('usSecFeeRate', v)} msgs={msgs.usSecFeeRate}
+          hint={RULES.us.secFeeNote + '。'}>
+          <Chips label="SEC Fee 快選"
+            options={[{ value: 0.00206, label: '0.00206% 玉山' }, { value: 0, label: '0%' }]}
+            isSelected={(v) => secVal != null && Math.abs(secVal - v) < 1e-9} onPick={(v) => setField('usSecFeeRate', String(v))} />
+        </TextField>
+        <div className="field">
+          <p id="lbl-ustaf" className="field-label mb-2">FINRA 交易活動費（TAF）</p>
+          <Segmented idBase="ustaf" labelledBy="lbl-ustaf" value={inputs.usTafEnabled === 'on' ? 'on' : 'off'}
+            options={[{ value: 'off', label: '不計入（玉山預設）' }, { value: 'on', label: '計入（$0.000195/股）' }]}
+            onChange={(v) => setField('usTafEnabled', v)} />
+          <p className="field-hint">{RULES.us.tafNote}。</p>
+        </div>
+        <TextField id="f-usfx" label="台幣參考匯率（選填）" value={inputs.usFxRate} suffix="TWD" placeholder="例如 32.5"
+          aside={!isBlank(inputs.usFxRate) ? (
+            <button type="button" className="btn btn-plain btn-sm press -my-2.5 -mr-2" onClick={(e) => { setField('usFxRate', ''); keepFocus(e, 'f-usfx'); }}>清除</button>
+          ) : 'USD / TWD'}
+          onChange={(v) => setField('usFxRate', v)} msgs={msgs.usFxRate}
+          hint="填寫後於明細顯示約當台幣金額（僅供參考，不含換匯價差）。" />
+      </Disclosure>
+    );
+  }
   const d = T.parseDiscount(inputs.discount);
   const modelLabel = RULES.commission.models[inputs.feeModel] ? RULES.commission.models[inputs.feeModel].label : '即時折讓';
-  const minFeeText = result.ok ? String(result.fee.minFee) : (isBlank(inputs.minFee) ? String(RULES.commission.defaultMinFee) : inputs.minFee);
-  const eff = result.ok ? result.fee.effectiveRate : RULES.commission.baseRate * d.value;
-  const n = countWarn(msgs, SECTION_FIELDS.fees);
+  const minFeeText = result.ok && result.market === 'tw' ? String(result.fee.minFee) : (isBlank(inputs.minFee) ? String(RULES.commission.defaultMinFee) : inputs.minFee);
+  const eff = result.ok && result.market === 'tw' ? result.fee.effectiveRate : RULES.commission.baseRate * d.value;
   return (
     <Disclosure id="fees" title="費用設定" open={open} onToggle={onToggle}
       summary={d.label + '・低消 ' + minFeeText + '・' + modelLabel}
@@ -2921,9 +3429,20 @@ function CreditSection({ inputs, setField, result, msgs, open, onToggle, today }
 
 // ── 進階 ─────────────────────────────────────────────────────────────
 function AdvancedSection({ inputs, setField, result, msgs, open, onToggle, today }) {
-  const n = countWarn(msgs, SECTION_FIELDS.advanced);
+  const isUs = inputs.market === 'us';
+  const n = countWarn(msgs, isUs ? ['targets'] : SECTION_FIELDS.advanced);
   const lim = result.ok ? result.limits : null;
   const capLabel = result.ok ? result.entry.capitalBaseLabel : '報酬率分母';
+  if (isUs) {
+    return (
+      <Disclosure id="advanced" title="進階" open={open} onToggle={onToggle} summary="目標淨利率"
+        badge={n ? <span className="badge badge-warn"><Icon name="warn" size={12} />{n}</span> : null}>
+        <TextField id="f-targets" label="目標淨利率" value={inputs.targets} inputMode="text" placeholder={DEFAULTS.targets} maxLength={120}
+          onChange={(v) => setField('targets', v)} msgs={msgs.targets}
+          hint={'單位 %，以逗號分隔，最多 ' + RULES.maxTargets + ' 項；依「' + capLabel + '」計算。'} />
+      </Disclosure>
+    );
+  }
   const summary = [
     isBlank(inputs.refPrice) ? '未設漲跌停' : '參考價 ' + inputs.refPrice,
     isBlank(inputs.tradeDate) ? '交易日 今日' : '交易日 ' + inputs.tradeDate,
@@ -2981,31 +3500,35 @@ function SummaryCard({ r, cardRef }) {
       try { performance.mark('tw:first-result'); } catch (e) { /* 忽略 */ }
     }
   }, []);
+  const isUs = r.market === 'us';
   const e = r.entry;
   const be = r.breakEven;
   const mx = r.manualExit;
   const sl = r.stopLoss;
   const dirLabel = r.mode.directions.length > 1 ? '・' + r.mode.directionLabels[r.direction] : '';
-  const isMarginMode = r.tradeMode === 'marginLong' || r.tradeMode === 'marginShort';
+  const isMarginMode = !isUs && (r.tradeMode === 'marginLong' || r.tradeMode === 'marginShort');
   const tiles = [];
   const primary = (
     <Tile primary label="損益兩平價"
-      value={be.reachable ? <PriceTag value={be.exitPrice} base={r.entryPrice} /> : <span className="c-warn">無法達成</span>}
-      flag={be.reachable && be.beyondLimit ? <BeyondFlag price={be.exitPrice} limits={r.limits} /> : null}
+      value={be.reachable ? <PriceTag value={be.exitPrice} base={r.entryPrice} isUs={isUs} /> : <span className="c-warn">無法達成</span>}
+      flag={!isUs && be.reachable && be.beyondLimit ? <BeyondFlag price={be.exitPrice} limits={r.limits} /> : null}
       sub={be.reachable
-        ? [breakEvenMove(be.ticks), pct(be.changeRate, true), '理論價 ' + priceText(be.theoreticalPrice)]
+        ? [breakEvenMove(be.ticks), pct(be.changeRate, true), '理論價 ' + priceText(be.theoreticalPrice, isUs)]
         : '費用高於此方向的可能獲利'} />
   );
   if (mx) {
+    const fxSub = isUs && r.fxRate ? twdApprox(mx.profit, r.fxRate, true) : null;
     tiles.push(<Tile key="pl" label="淨損益"
-      value={<span className={signCls(mx.profit)}>{smoney(mx.profit)}</span>}
-      sub={['出場 ' + priceText(mx.exitPrice), e.returnRateLabel + ' ' + pct(mx.returnRate, true)]} />);
+      value={<span className={signCls(mx.profit)}>{smoney(mx.profit, isUs)}</span>}
+      sub={['出場 ' + priceText(mx.exitPrice, isUs), e.returnRateLabel + ' ' + pct(mx.returnRate, true), fxSub]} />);
   } else {
-    const parts = ['手續費＋證交稅'];
-    if (e.shortFee > 0 || be.exitShortFee > 0) parts.push('＋融券手續費');
-    if (e.interestType === 'cost') parts.push('＋融資利息');
-    if (e.interestType === 'income') parts.push('−利息收入');
-    tiles.push(<Tile key="cost" label="兩平來回成本" value={money(be.totalCosts)} sub={parts} sep="" />);
+    const parts = isUs
+      ? ['買賣手續費' + (r.tax.rate > 0 ? '＋SEC Fee' : '') + (r.taf && r.taf.enabled ? '＋TAF' : '')]
+      : ['手續費＋證交稅'];
+    if (!isUs && (e.shortFee > 0 || be.exitShortFee > 0)) parts.push('＋融券手續費');
+    if (!isUs && e.interestType === 'cost') parts.push('＋融資利息');
+    if (!isUs && e.interestType === 'income') parts.push('−利息收入');
+    tiles.push(<Tile key="cost" label="兩平來回成本" value={money(be.totalCosts, isUs)} sub={parts} sep="" />);
   }
   if (isMarginMode) {
     if (e.marginCallPrice != null) {
@@ -3025,14 +3548,16 @@ function SummaryCard({ r, cardRef }) {
   }
   if (sl) {
     tiles.push(<Tile key="sl" label="停損價"
-      value={sl.reachable ? <PriceTag value={sl.exitPrice} base={r.entryPrice} /> : <span className="c-warn">無對應價</span>}
-      flag={sl.reachable && sl.beyondLimit ? <BeyondFlag price={sl.exitPrice} limits={r.limits} /> : null}
-      sub={sl.reachable ? [ticksText(sl.ticks), '損益 ' + smoney(sl.profit), '停損 ' + money(sl.stopLossAmount) + ' 元'] : ['停損 ' + money(sl.stopLossAmount) + ' 元', '超過最大可能虧損']} />);
+      value={sl.reachable ? <PriceTag value={sl.exitPrice} base={r.entryPrice} isUs={isUs} /> : <span className="c-warn">無對應價</span>}
+      flag={!isUs && sl.reachable && sl.beyondLimit ? <BeyondFlag price={sl.exitPrice} limits={r.limits} /> : null}
+      sub={sl.reachable ? [ticksText(sl.ticks), '損益 ' + smoney(sl.profit, isUs), '停損 ' + money(sl.stopLossAmount, isUs) + (isUs ? '' : ' 元')] : ['停損 ' + money(sl.stopLossAmount, isUs) + (isUs ? '' : ' 元'), '超過最大可能虧損']} />);
   }
   return (
     <div className="card card-pad" id="result-summary" ref={cardRef}>
       <p className="sum-head">
-        {r.mode.label + dirLabel}・{r.product.label}・{intText(r.lots)} 張 @ {priceText(r.entryPrice)}
+        {isUs
+          ? <React.Fragment>{r.mode.label + dirLabel}・{intText(r.shares)} 股 @ {priceText(r.entryPrice, true)}</React.Fragment>
+          : <React.Fragment>{r.mode.label + dirLabel}・{r.product.label}・{intText(r.lots)} 張 @ {priceText(r.entryPrice)}</React.Fragment>}
         {r.entryPriceAdjusted ? <span className="badge badge-warn ml-2">已對齊檔位</span> : null}
       </p>
       {primary}
@@ -3059,31 +3584,33 @@ function NotesBlock({ r }) {
 }
 
 // ── 結果：明細 ─────────────────────────────────────────────────────────
-function commissionRow(label, c, model) {
+function commissionRow(label, c, model, isUs) {
   if (model === 'monthly') {
-    return { label, value: money(c.charged), sub: '次月退 ' + money(c.refund) + '・實付 ' + money(c.net) };
+    return { label, value: money(c.charged, isUs), sub: '次月退 ' + money(c.refund, isUs) + '・實付 ' + money(c.net, isUs) };
   }
-  return { label, value: money(c.charged) };
+  return { label, value: money(c.charged, isUs) };
 }
 
 function EntryCard({ r }) {
+  const isUs = r.market === 'us';
   const e = r.entry;
   const act = r.mode.actions[r.direction];
-  const ML = r.tradeMode === 'marginLong';
-  const MS = r.tradeMode === 'marginShort';
+  const ML = !isUs && r.tradeMode === 'marginLong';
+  const MS = !isUs && r.tradeMode === 'marginShort';
   const rows = [
-    { label: act.entry + '成交金額', value: money(e.gross) },
+    { label: act.entry + '成交金額', value: money(e.gross, isUs) },
     ML ? { label: '融資金額（' + ratio(r.credit.loanRatio) + '）', value: money(e.loan), sub: '千元以下捨去' } : null,
     ML ? { label: '自備款（' + ratio(r.credit.selfRatio) + '）', value: money(e.selfFunds) } : null,
     MS ? { label: '融券保證金（' + ratio(r.credit.marginRatio) + (r.credit.marginRatioAuto ? '・自動' : '') + '）', value: money(e.collateral), sub: '百元以下進位' } : null,
-    commissionRow('手續費', e.commission, r.fee.model),
-    e.tax > 0 ? { label: '證交稅（' + ratio(r.tax.rate) + '）', value: money(e.tax) } : null,
+    commissionRow('手續費' + (isUs ? '（' + ratio(r.fee.effectiveRate) + '）' : ''), e.commission, r.fee.model, isUs),
+    e.tax > 0 ? { label: (isUs ? 'SEC Fee（' : '證交稅（') + ratio(r.tax.rate) + '）', value: money(e.tax, isUs) } : null,
+    isUs && e.taf > 0 ? { label: 'FINRA TAF 費', value: money(e.taf, true) } : null,
     e.shortFee > 0 ? { label: '融券手續費（' + ratio(r.credit.feeRate) + '）', value: money(e.shortFee) } : null,
     MS ? { label: '融券擔保價款', value: money(e.guaranty), sub: '賣出價款扣費稅後由券商保管' } : null,
     e.cashOut > 0
-      ? { label: MS ? '進場應付（僅保證金）' : '進場應付', value: money(e.cashOut), strong: true, total: true }
-      : { label: '進場實收', value: money(e.cashIn), strong: true, total: true },
-    { label: '報酬率分母', value: money(e.capitalBase), sub: e.capitalBaseLabel },
+      ? { label: MS ? '進場應付（僅保證金）' : '進場應付', value: money(e.cashOut, isUs), sub: isUs && r.fxRate ? twdApprox(e.cashOut, r.fxRate) : null, strong: true, total: true }
+      : { label: '進場實收', value: money(e.cashIn, isUs), sub: isUs && r.fxRate ? twdApprox(e.cashIn, r.fxRate) : null, strong: true, total: true },
+    { label: '報酬率分母', value: money(e.capitalBase, isUs), sub: e.capitalBaseLabel },
     ML ? (e.loan > 0
       ? { label: '進場維持率', value: F.maintenance(e.maintenance) }
       : { label: '進場維持率', value: '未動用融資' }) : null,
@@ -3093,7 +3620,7 @@ function EntryCard({ r }) {
     <section className="card card-pad" aria-labelledby="sec-entry">
       <div className="card-title">
         <h3 id="sec-entry" className="headline">進場明細</h3>
-        <span className="badge badge-gray">{act.entry} {priceText(r.entryPrice)}</span>
+        <span className="badge badge-gray">{act.entry} {priceText(r.entryPrice, isUs)}</span>
       </div>
       <DL rows={rows} />
     </section>
@@ -3101,36 +3628,46 @@ function EntryCard({ r }) {
 }
 
 function ExitCard({ r }) {
+  const isUs = r.market === 'us';
   const e = r.entry;
   const t = r.manualExit || r.breakEven;
   const isManual = !!r.manualExit;
   const act = r.mode.actions[r.direction];
-  const ML = r.tradeMode === 'marginLong';
-  const MS = r.tradeMode === 'marginShort';
+  const ML = !isUs && r.tradeMode === 'marginLong';
+  const MS = !isUs && r.tradeMode === 'marginShort';
   const sameDay = r.mode.sameDay;
   const amt = t.settlement.amount;
   let settleSub = null;
   let settleTone = '';
   if (sameDay) settleSub = amt >= 0 ? '應收' : '應付';
+  else if (isUs && r.direction === 'short') settleSub = isUs && r.fxRate ? twdApprox(Math.abs(amt), r.fxRate) : null;
   else if (amt < 0) { settleSub = '需補繳'; settleTone = 'c-danger'; }
+  else if (isUs && r.fxRate) settleSub = twdApprox(amt, r.fxRate);
   const rows = [
     MS ? { label: '退還保證金＋擔保價款', value: money(e.collateral + e.guaranty) } : null,
-    { label: act.exit + '成交金額', value: money(t.exitGross) },
+    { label: act.exit + '成交金額', value: money(t.exitGross, isUs) },
     ML ? { label: '償還融資', value: money(e.loan) } : null,
     ML ? { label: '融資利息（' + e.days + ' 天・' + ratio(r.credit.interestRate) + '）', value: money(t.interest) } : null,
     MS ? { label: '融券利息收入（' + e.days + ' 天・' + ratio(r.credit.interestRate) + '）', value: '+' + money(t.interest) } : null,
-    commissionRow('手續費', t.exitCommission, r.fee.model),
-    t.exitTax > 0 ? { label: '證交稅（' + ratio(r.tax.rate) + '）', value: money(t.exitTax) } : null,
+    commissionRow('手續費' + (isUs ? '（' + ratio(r.fee.effectiveRate) + '）' : ''), t.exitCommission, r.fee.model, isUs),
+    t.exitTax > 0 ? { label: (isUs ? 'SEC Fee（' : '證交稅（') + ratio(r.tax.rate) + '）', value: money(t.exitTax, isUs) } : null,
+    isUs && t.exitTaf > 0 ? { label: 'FINRA TAF 費', value: money(t.exitTaf, true) } : null,
     t.exitShortFee > 0 ? { label: '融券手續費（' + ratio(r.credit.feeRate) + '）', value: money(t.exitShortFee) } : null,
     sameDay ? (e.cashOut > 0
       ? { label: '與進場相抵（進場應付）', value: money(e.cashOut) }
       : { label: '與進場相抵（進場實收）', value: money(e.cashIn) }) : null,
     {
-      label: t.settlement.label, value: amt < 0 && !sameDay ? <span><Icon name="warn" size={16} className="inline-block align-[-2px] mr-1" />{smoney(amt)}</span> : smoney(amt),
+      label: t.settlement.label,
+      value: amt < 0 && !sameDay && !(isUs && r.direction === 'short') ? <span><Icon name="warn" size={16} className="inline-block align-[-2px] mr-1" />{smoney(amt, isUs)}</span> : smoney(amt, isUs),
       sub: settleSub, tone: settleTone, strong: true, total: true,
     },
-    { label: '來回總成本', value: money(t.totalCosts), sub: '手續費＋稅' + (t.interestType === 'cost' ? '＋利息' : t.interestType === 'income' ? '−利息收入' : '') + (e.shortFee > 0 || t.exitShortFee > 0 ? '＋融券手續費' : '') },
-    { label: '淨損益', value: smoney(t.profit), tone: signCls(t.profit), strong: true },
+    {
+      label: '來回總成本', value: money(t.totalCosts, isUs),
+      sub: isUs
+        ? '買賣手續費' + (r.tax.rate > 0 ? '＋SEC Fee' : '') + (r.taf && r.taf.enabled ? '＋TAF' : '')
+        : '手續費＋稅' + (t.interestType === 'cost' ? '＋利息' : t.interestType === 'income' ? '−利息收入' : '') + (e.shortFee > 0 || t.exitShortFee > 0 ? '＋融券手續費' : ''),
+    },
+    { label: '淨損益', value: smoney(t.profit, isUs), sub: isUs && r.fxRate ? twdApprox(t.profit, r.fxRate, true) : null, tone: signCls(t.profit), strong: true },
     { label: e.returnRateLabel, value: pct(t.returnRate, true), tone: signCls(t.profit), sub: '淨損益 ÷ ' + e.capitalBaseLabel },
     { label: '價差報酬率', labelSub: '依方向計算的價格變動，不含費用與槓桿', value: pct(t.nominalReturnRate, true), tone: signCls(t.nominalReturnRate) },
     t.maintenance != null ? {
@@ -3145,7 +3682,7 @@ function ExitCard({ r }) {
       <div className="card-title">
         <h3 id="sec-exit" className="headline">出場明細</h3>
         <span className={'badge ' + (isManual ? 'badge-accent' : 'badge-gray')}>
-          {isManual ? '自訂 ' + priceText(t.exitPrice) : '兩平價 ' + priceText(t.exitPrice) + '（參考）'}
+          {isManual ? '自訂 ' + priceText(t.exitPrice, isUs) : '兩平價 ' + priceText(t.exitPrice, isUs) + '（參考）'}
         </span>
       </div>
       <DL rows={rows} />
@@ -3162,6 +3699,25 @@ function nextShortNote(tradeDate) {
 }
 
 function ConditionsCard({ r, today }) {
+  const isUs = r.market === 'us';
+  if (isUs) {
+    const rows = [
+      { label: '券商手續費率', value: ratio(r.fee.effectiveRate), sub: r.fee.modelLabel + '・' + RULES.us.feeRounding },
+      { label: '交易徵費（SEC Fee）', value: r.tax.label, sub: r.tax.note },
+      { label: 'FINRA TAF 費', value: r.taf.enabled ? money(r.taf.amount, true) + '（已開啟）' : '未計入（玉山預設）', sub: r.taf.note },
+      { label: '總股數', value: intText(r.shares) + ' 股', sub: '升降單位 $0.01・無漲跌停限制' },
+      r.fxRate ? { label: '台幣參考匯率', value: '1 USD = ' + r.fxRate + ' TWD', sub: '僅供約當台幣換算，不含換匯價差' } : null,
+    ];
+    return (
+      <section className="card card-pad" aria-labelledby="sec-cond">
+        <div className="card-title"><h3 id="sec-cond" className="headline">費率與條件</h3></div>
+        <DL rows={rows} />
+        <ul className="mt-3 space-y-1">
+          {r.mode.notes.map((n) => <li key={n} className="footnote">・{n}</li>)}
+        </ul>
+      </section>
+    );
+  }
   // 融資的證交稅依出場日（交易日期＋融資天數）判斷；判斷日不是交易日期時明確標示。
   // 只有債券ETF 的稅率會隨日期改變（停徵期間），個股／ETF 信用交易稅率固定，不顯示以免干擾。
   const exitBasis = r.tax.basis === 'exit' && r.tax.date && r.tax.date !== r.tradeDate && !r.tax.overridden && r.productType === 'bondEtf';
@@ -3190,6 +3746,7 @@ function ConditionsCard({ r, today }) {
 
 // ── 結果：目標價 ───────────────────────────────────────────────────────
 function TargetsCard({ r, onApplyExit, onEditTargets }) {
+  const isUs = r.market === 'us';
   const [openIdx, setOpenIdx] = useState(null);
   const list = r.targets || [];
   return (
@@ -3216,11 +3773,11 @@ function TargetsCard({ r, onApplyExit, onEditTargets }) {
                   onClick={() => setOpenIdx(isOpen ? null : i)}>
                   <span className={'tgt-pct ' + signCls(t.targetRate)}>{pct(t.targetRate, true)}</span>
                   <span className="tgt-price">
-                    {t.reachable ? <PriceTag value={t.exitPrice} base={r.entryPrice} /> : <span className="c-warn">無法達成</span>}
+                    {t.reachable ? <PriceTag value={t.exitPrice} base={r.entryPrice} isUs={isUs} /> : <span className="c-warn">無法達成</span>}
                     <small>{t.reachable ? ticksText(t.ticks) + (t.beyondLimit ? '・超出漲跌停' : '') : '超出可達範圍'}</small>
                   </span>
                   <span className={'tgt-pl ' + (t.reachable ? signCls(t.profit) : 'c-ink3')}>
-                    {t.reachable ? smoney(t.profit) : '--'}
+                    {t.reachable ? smoney(t.profit, isUs) : '--'}
                     <small>{t.reachable ? '實際 ' + pct(t.returnRate, true) : ''}</small>
                   </span>
                   <Icon name="chevron" className="chev" size={18} />
@@ -3228,13 +3785,13 @@ function TargetsCard({ r, onApplyExit, onEditTargets }) {
                 {isOpen ? (
                   <div id={'tgt-' + i} className="tgt-detail">
                     <dl>
-                      <div><dt>目標淨利</dt><dd className={signCls(t.desiredProfit)}>{smoney(t.desiredProfit)}</dd></div>
-                      <div><dt>理論價</dt><dd>{priceText(t.theoreticalPrice)}</dd></div>
+                      <div><dt>目標淨利</dt><dd className={signCls(t.desiredProfit)}>{smoney(t.desiredProfit, isUs)}</dd></div>
+                      <div><dt>理論價</dt><dd>{priceText(t.theoreticalPrice, isUs)}</dd></div>
                       <div><dt>實際淨利率</dt><dd className={signCls(t.profit)}>{pct(t.returnRate, true)}</dd></div>
-                      <div><dt>來回總成本</dt><dd>{money(t.totalCosts)}</dd></div>
+                      <div><dt>來回總成本</dt><dd>{money(t.totalCosts, isUs)}</dd></div>
                     </dl>
                     {t.reachable ? (
-                      <button type="button" className="btn btn-tinted btn-sm press" onClick={() => onApplyExit(t.exitPrice)}>設為出場價 {priceText(t.exitPrice)}</button>
+                      <button type="button" className="btn btn-tinted btn-sm press" onClick={() => onApplyExit(t.exitPrice)}>設為出場價 {priceText(t.exitPrice, isUs)}</button>
                     ) : <p className="footnote">此目標在價格範圍內無法達成。</p>}
                   </div>
                 ) : null}
@@ -3248,7 +3805,7 @@ function TargetsCard({ r, onApplyExit, onEditTargets }) {
 }
 
 // ── 結果：價格階梯 ─────────────────────────────────────────────────────
-function LadderRow({ row, entryPrice, credit, isCurrent, onApply }) {
+function LadderRow({ row, entryPrice, credit, isCurrent, isUs, onApply }) {
   const tags = [];
   const said = [];
   if (row.isEntry) { tags.push(<span key="e" className="badge badge-hl">進場</span>); said.push('進場價'); }
@@ -3259,28 +3816,28 @@ function LadderRow({ row, entryPrice, credit, isCurrent, onApply }) {
   if (row.beyondLimit) { tags.push(<span key="x" className="badge badge-gray">超出漲跌停</span>); said.push('超出漲跌停'); }
   if (isCurrent) { tags.push(<span key="c" className="badge badge-accent">目前出場</span>); said.push('目前出場價'); }
   const cls = 'lad-row row-press' + (row.isEntry ? ' is-entry' : '') + (row.beyondLimit ? ' is-beyond' : '') + (isCurrent ? ' is-current' : '');
-  const aria = '帶入出場價 ' + priceText(row.exitPrice) + '，' + ticksText(row.ticks) + '，損益 ' + smoney(row.profit) + (said.length ? '（' + said.join('、') + '）' : '');
+  const aria = '帶入出場價 ' + priceText(row.exitPrice, isUs) + '，' + ticksText(row.ticks) + '，損益 ' + smoney(row.profit, isUs) + (said.length ? '（' + said.join('、') + '）' : '');
   return (
     <li>
       <button type="button" className={cls} onClick={() => onApply(row.exitPrice)} aria-label={aria} aria-current={isCurrent ? 'true' : undefined}>
         <Haptic />
         <span className="lad-c1">
-          <span className="lad-price"><PriceTag value={row.exitPrice} base={entryPrice} />{tags}</span>
+          <span className="lad-price"><PriceTag value={row.exitPrice} base={entryPrice} isUs={isUs} />{tags}</span>
           <span className="lad-meta">{ticksText(row.ticks)}・{pct(row.changeRate, true)}</span>
         </span>
         <span className="lad-cm">
-          <span className="lad-sm">{money(row.totalCosts)}</span>
+          <span className="lad-sm">{money(row.totalCosts, isUs)}</span>
           {credit ? <span className={'lad-sm' + (row.belowCall ? ' c-danger' : '')}>{row.belowCall ? <Icon name="warn" size={13} className="inline-block align-[-1px] mr-0.5" /> : null}{F.maintenance(row.maintenance)}</span> : null}
         </span>
         <span className="lad-c2">
-          <span className={'lad-pl ' + signCls(row.profit)}>{smoney(row.profit)}</span>
+          <span className={'lad-pl ' + signCls(row.profit)}>{smoney(row.profit, isUs)}</span>
           <span className={'lad-meta ' + signCls(row.profit)}>{pct(row.returnRate, true)}</span>
         </span>
         <span className="lad-cols">
           <span>{ticksText(row.ticks)}</span>
           <span className={signCls(row.changeRate)}>{pct(row.changeRate, true)}</span>
-          <span>{money(row.totalCosts)}</span>
-          <span className={signCls(row.profit) + ' font-semibold'}>{smoney(row.profit)}</span>
+          <span>{money(row.totalCosts, isUs)}</span>
+          <span className={signCls(row.profit) + ' font-semibold'}>{smoney(row.profit, isUs)}</span>
           <span className={signCls(row.profit)}>{pct(row.returnRate, true)}</span>
           {credit ? <span className={row.belowCall ? 'c-danger font-semibold' : ''}>{row.belowCall ? <Icon name="warn" size={14} className="inline-block align-[-2px] mr-1" /> : null}{F.maintenance(row.maintenance)}</span> : null}
         </span>
@@ -3290,6 +3847,7 @@ function LadderRow({ row, entryPrice, credit, isCurrent, onApply }) {
 }
 
 function LadderCard({ r, ext, setExt, onApplyExit }) {
+  const isUs = r.market === 'us';
   const rows = useMemo(() => T.buildLadder(r, ext).rows, [r, ext]);
   const credit = r.entry.maintenance != null;
   const cur = r.manualExit ? r.manualExit.exitPrice : null;
@@ -3317,7 +3875,7 @@ function LadderCard({ r, ext, setExt, onApplyExit }) {
       </div>
       <ul className="list" aria-label="價格階梯（由高到低）">
         {rows.map((row) => (
-          <LadderRow key={row.exitPrice} row={row} entryPrice={r.entryPrice} credit={credit}
+          <LadderRow key={row.exitPrice} row={row} entryPrice={r.entryPrice} credit={credit} isUs={isUs}
             isCurrent={cur != null && row.exitPrice === cur} onApply={onApplyExit} />
         ))}
       </ul>
@@ -3339,7 +3897,15 @@ function About({ open, onToggle }) {
     <Disclosure id="about" title="說明與揭露" open={open} onToggle={onToggle}
       summary={'未納入項目、規則來源與免責聲明・資料基準日 ' + RULES.dataAsOf}>
       <div className="prose">
-        <h3>未納入計算的項目</h3>
+        <h3>美股複委託（預設參考玉山證券）</h3>
+        <ul>
+          <li><b>牌告手續費</b>：預設 {RULES.us.defaultFeeRate}%（人工／電子下單相同），買賣各收，四捨五入至 $0.01；<b>最低手續費</b>：免低收（$0）。可於費用設定自行調整其他券商費率與低消。</li>
+          <li><b>交易徵費（SEC Fee）</b>：預設 {RULES.us.defaultSecFeeRate}%，僅賣出收取，無條件進位至 $0.01（不足 $0.01 以 $0.01 計）。</li>
+          <li><b>FINRA 交易活動費（TAF）</b>：{RULES.us.tafNote}。</li>
+          <li><b>其他複委託費用（未納入）</b>：買進法國 ADR 金融交易稅 0.3%（低消 $0.01）、買進義大利 ADR 0.1%（低消 $0.01）、ADR 保管費每股 $0.02–$0.05、現金股利預扣稅（30%）、換匯價差。</li>
+          <li>參考來源：玉山證券複委託交易手續費（esunsec.com.tw/campaign/trade-fee-foreign）。</li>
+        </ul>
+        <h3>台股未納入計算的項目</h3>
         <ul>{RULES.notModeled.map((x) => <li key={x}>{x}</li>)}</ul>
         <h3>手續費</h3>
         <p>上限 {RULES.commission.baseRateLabel}，買賣各收；{RULES.commission.rounding}。</p>
@@ -3404,12 +3970,13 @@ function About({ open, onToggle }) {
 
 // ── 浮動元件 ─────────────────────────────────────────────────────────
 function SummaryBar({ r, onJump }) {
+  const isUs = r.market === 'us';
   const be = r.breakEven;
   const mx = r.manualExit;
   const e = r.entry;
-  const items = [{ k: 'be', label: '兩平價', node: be.reachable ? <PriceTag value={be.exitPrice} base={r.entryPrice} /> : <span className="c-warn">無法達成</span> }];
+  const items = [{ k: 'be', label: '兩平價', node: be.reachable ? <PriceTag value={be.exitPrice} base={r.entryPrice} isUs={isUs} /> : <span className="c-warn">無法達成</span> }];
   if (mx) {
-    items.push({ k: 'pl', label: '淨損益', node: <span className={signCls(mx.profit)}>{smoney(mx.profit)}</span> });
+    items.push({ k: 'pl', label: '淨損益', node: <span className={signCls(mx.profit)}>{smoney(mx.profit, isUs)}</span> });
     items.push({ k: 'rr', label: e.returnRateLabel, node: <span className={signCls(mx.profit)}>{pct(mx.returnRate, true)}</span> });
   } else if (e.marginCallPrice != null) {
     items.push({ k: 'call', label: '追繳價', node: <PriceTag value={e.marginCallPrice} base={r.entryPrice} /> });
@@ -3572,6 +4139,7 @@ function App() {
     };
   }, []);
 
+  const isUs = inputs.market === 'us';
   const mode = T.MODES[inputs.tradeMode] || T.MODES.marginLong;
   const direction = mode.directions.indexOf(inputs.direction) >= 0 ? inputs.direction : mode.directions[0];
   const calcInputs = useMemo(() => Object.assign({}, inputs, { direction, tradeDate: isBlank(inputs.tradeDate) ? today : inputs.tradeDate }), [inputs, direction, today]);
@@ -3583,7 +4151,7 @@ function App() {
   }, []);
   const msgs = useMemo(() => buildFieldMsgs(result, setField), [result, setField]);
   // 有結果時用引擎實際採用的稅率（融資依出場日判斷）；否則依交易日期預估
-  const taxInfo = useMemo(() => (result.ok ? result.tax : T.resolveTaxRate({
+  const taxInfo = useMemo(() => (result.ok && result.market === 'tw' ? result.tax : T.resolveTaxRate({
     productType: inputs.productType, tradeMode: inputs.tradeMode,
     tradeDate: calcInputs.tradeDate, taxRateOverride: inputs.taxRateOverride,
   })), [result, inputs.productType, inputs.tradeMode, calcInputs.tradeDate, inputs.taxRateOverride]);
@@ -3599,9 +4167,10 @@ function App() {
   // 螢幕閱讀器：結果摘要（延遲播報，避免逐字打斷）
   const liveText = useMemo(() => {
     if (!result.ok) return '';
+    const us = result.market === 'us';
     const be = result.breakEven;
-    let s = be.reachable ? '兩平價 ' + priceText(be.exitPrice) + '，' + ticksText(be.ticks) : '兩平價無法達成';
-    if (result.manualExit) s += '。出場 ' + priceText(result.manualExit.exitPrice) + '，淨損益 ' + smoney(result.manualExit.profit) + ' 元，' + result.entry.returnRateLabel + ' ' + pct(result.manualExit.returnRate, true);
+    let s = be.reachable ? '兩平價 ' + priceText(be.exitPrice, us) + '，' + ticksText(be.ticks) : '兩平價無法達成';
+    if (result.manualExit) s += '。出場 ' + priceText(result.manualExit.exitPrice, us) + '，淨損益 ' + smoney(result.manualExit.profit, us) + (us ? '' : ' 元') + '，' + result.entry.returnRateLabel + ' ' + pct(result.manualExit.returnRate, true);
     if (result.entry.marginCallPrice != null) s += '。追繳價 ' + priceText(result.entry.marginCallPrice);
     return s;
   }, [result]);
@@ -3620,7 +4189,8 @@ function App() {
   }, [result.ok]);
 
   const stepPrice = (key, d) => {
-    const pt = inputs.productType;
+    const pt = isUs ? 'us' : inputs.productType;
+    const maxP = isUs ? RULES.us.priceMax : RULES.priceMax;
     let base = T.parseNumber(inputs[key]);
     if (base == null || !(base > 0)) {
       if (key !== 'exitPrice') return;
@@ -3629,8 +4199,8 @@ function App() {
     }
     const next = T.addTick(base, d, pt);
     // 往下到不了：已是最低價；往上超過價格上限（或原值已超出可處理範圍）：已達價格上限
-    if (next == null || (d > 0 && next > RULES.priceMax)) {
-      showToast(d < 0 && base <= 0.01 ? '已是最低價 0.01' : '已達價格上限 ' + intText(RULES.priceMax) + ' 元', 'warn');
+    if (next == null || (d > 0 && next > maxP)) {
+      showToast(d < 0 && base <= 0.01 ? (isUs ? '已是最低價 $0.01' : '已是最低價 0.01') : '已達價格上限 ' + (isUs ? '$' : '') + intText(maxP) + (isUs ? '' : ' 元'), 'warn');
       return;
     }
     setField(key, fmtInputPrice(next));
@@ -3640,9 +4210,14 @@ function App() {
     const n = cur != null && cur >= 1 ? Math.round(cur) : (d > 0 ? 0 : 1);
     setField('lots', String(Math.min(100000, Math.max(1, n + d))));
   };
+  const stepShares = (d) => {
+    const cur = T.parseNumber(inputs.usShares);
+    const n = cur != null && cur >= 1 ? Math.round(cur) : (d > 0 ? 0 : 1);
+    setField('usShares', String(Math.min(RULES.us.sharesMax, Math.max(1, n + d))));
+  };
   const applyExit = (p) => {
     setField('exitPrice', fmtInputPrice(p));
-    showToast('已帶入出場價 ' + priceText(p));
+    showToast('已帶入出場價 ' + priceText(p, isUs));
   };
   const toggleOpen = (k) => setUi((u) => Object.assign({}, u, { open: Object.assign({}, u.open, { [k]: !u.open[k] }) }));
   const setTab = (t) => setUi((u) => Object.assign({}, u, { tab: t }));
@@ -3689,7 +4264,7 @@ function App() {
     };
     if (isHttp && navigator.share) {
       let p;
-      try { p = navigator.share({ title: '台股當沖・融資融券計算機', text, url }); } catch (err) { fallback(); return; }
+      try { p = navigator.share({ title: isUs ? '美股複委託交易計算機' : '台股當沖・融資融券計算機', text, url }); } catch (err) { fallback(); return; }
       if (p && p.then) p.then(() => {}, (err) => { if (!err || err.name !== 'AbortError') fallback(); });
       return;
     }
@@ -3697,7 +4272,7 @@ function App() {
   };
 
   const showA2HS = IS_IOS && !IS_STANDALONE && !dismissed.a2hs;
-  const isCredit = mode.credit;
+  const isCredit = !isUs && mode.credit;
   const status = result.ok ? 'ok' : isEmpty ? 'empty' : 'error';
   const tabOptions = [{ value: 'details', label: '明細' }, { value: 'targets', label: '目標價' }, { value: 'ladder', label: '價格階梯' }];
 
@@ -3717,8 +4292,12 @@ function App() {
       <Header scrolled={scrolled} onShare={onShare} onReset={() => setConfirmReset(true)} onAbout={onAbout} />
       <main className="gutter page-bottom mx-auto w-full max-w-[1280px]">
         <div className="pt-1 pb-4 lg:pb-6" ref={titleRef}>
-          <h1 className="large-title">台股當沖・融資融券計算機</h1>
-          <p className="subtitle"><Parts parts={['手續費、證交稅、利息、兩平價與追繳價', '依台股規則逐檔試算']} sep="，" /></p>
+          <h1 className="large-title">{isUs ? '美股複委託計算機' : '台股當沖・融資融券計算機'}</h1>
+          <p className="subtitle">
+            {isUs
+              ? <Parts parts={['手續費 0.08% 免低收、SEC Fee 0.00206%、兩平價與目標價', '優先參考玉山證券複委託']} sep="，" />
+              : <Parts parts={['手續費、證交稅、利息、兩平價與追繳價', '依台股規則逐檔試算']} sep="，" />}
+          </p>
         </div>
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-[400px_minmax(0,1fr)] lg:gap-6 items-start">
           <div className="input-col min-w-0 space-y-3 lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100dvh-2rem)] lg:overflow-auto">
@@ -3733,7 +4312,7 @@ function App() {
               </div>
             ) : null}
             <TradeCard inputs={inputs} direction={direction} setField={setField} msgs={msgs} taxInfo={taxInfo} />
-            <PriceCard inputs={inputs} setField={setField} result={result} msgs={msgs} onStepPrice={stepPrice} onStepLots={stepLots} />
+            <PriceCard inputs={inputs} setField={setField} result={result} msgs={msgs} onStepPrice={stepPrice} onStepLots={stepLots} onStepShares={stepShares} />
             <FeeSection inputs={inputs} setField={setField} result={result} msgs={msgs} open={ui.open.fees} onToggle={() => toggleOpen('fees')} />
             {isCredit ? <CreditSection inputs={inputs} setField={setField} result={result} msgs={msgs} open={ui.open.credit} onToggle={() => toggleOpen('credit')} today={today} /> : null}
             <AdvancedSection inputs={inputs} setField={setField} result={result} msgs={msgs} open={ui.open.advanced} onToggle={() => toggleOpen('advanced')} today={today} />
@@ -3744,7 +4323,11 @@ function App() {
             {status === 'empty' ? (
               <div className="card card-pad" data-testid="empty">
                 <p className="headline">輸入進場價即可看到結果</p>
-                <p className="footnote mt-2">選好交易類型與商品後，輸入進場價與張數；兩平價、追繳價、目標價與價格階梯會立即計算。</p>
+                <p className="footnote mt-2">
+                  {isUs
+                    ? '輸入進場價（USD）與股數；兩平價、目標價與價格階梯會依美股複委託規則立即計算。'
+                    : '選好交易類型與商品後，輸入進場價與張數；兩平價、追繳價、目標價與價格階梯會立即計算。'}
+                </p>
               </div>
             ) : null}
             {status === 'error' ? (
